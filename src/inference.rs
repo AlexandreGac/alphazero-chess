@@ -1,0 +1,25 @@
+use burn::prelude::Backend;
+
+use crate::{create_player, validation::{play_one_game, Player}};
+
+pub fn play_against_model<B: Backend>(model_path: &String) {
+    let opponent = create_player::<B>(&model_path);
+    
+    println!("==== Game starts ====");
+    let human_player = Player::Human;
+
+    let human_start = true;
+    let result = if human_start {
+        play_one_game(&human_player, &opponent, 6)
+    } else {
+        -play_one_game(&opponent, &human_player, 6)
+    };
+
+    if result > 0.0 {
+        println!("Human Win!");
+    } else if result == 0.0 {
+        println!("Draw!");
+    } else {
+        println!("Opponent Win!");
+    }
+}
