@@ -544,7 +544,7 @@ fn render_charts(frame: &mut Frame, area: Rect, state: &TuiState) {
     let [min_x, max_x] = get_x_bounds(&[&state.policy_loss_history, &state.value_loss_history]);
     let x_labels = generate_axis_labels(min_x, max_x, 5, 0);
 
-    let y_bounds_loss = [0.0, 2.3];
+    let y_bounds_loss = [0.0, 4.0];
     let y_labels_loss = generate_axis_labels(y_bounds_loss[0], y_bounds_loss[1], 5, 1); // 5 labels, 1 decimal place
 
     let loss_chart = Chart::new(datasets_loss)
@@ -622,8 +622,8 @@ fn render_mcts_panel(frame: &mut Frame, area: Rect, state: &mut TuiState) {
     else {
         let msg = Paragraph::new(
             "No MCTS tree data available.
-                \n\nA tree will be sent here after a game or validation.
-                \nPress TAB to change panel.",
+                \nA tree will be sent here after a game or validation.
+                Press TAB to change panel.",
         )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true })

@@ -1,208 +1,109 @@
-// Added Piece and Role for the visual print_board function
-use shakmaty::{Chess, Color, File, Move, Position, Rank, Square, Piece, Role};
-use shakmaty::uci::UciMove;
-use rand::prelude::*; // Using your exact import
-use std::io::{self, Write};
-use std::str::FromStr;
+#![recursion_limit = "256"]
 
-// --- VISUAL ENHANCEMENTS START HERE ---
-// This is the only section that has been changed.
+mod chess;
+mod tree;
+mod agent;
+mod training;
+mod validation;
+mod inference;
+mod ratings;
+mod logger;
+mod memory;
+mod parameters;
 
-const SEARCH_DEPTH: u8 = 3;
+use burn::prelude::*;
+use burn::{backend::{Autodiff, Cuda}, prelude::Backend, record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder}};
+use clap::{Parser, Subcommand};
+use tokio::runtime;
 
-const RESET_COLOR: &str = "\x1b[0m";
-const LIGHT_SQUARE_BG: &str = "\x1b[48;5;222m";
-const DARK_SQUARE_BG: &str = "\x1b[48;5;173m";
+use crate::parameters::NUM_THREADS;
+use crate::ratings::compute_elo_rankings;
+use crate::validation::Player;
+use crate::{agent::AlphaZero, inference::play_against_model, training::train};
 
-/// Returns the Unicode character for a given chess piece.
-fn get_piece_symbol(piece: &Piece) -> &'static str {
-    match (piece.role, piece.color) {
-        (Role::Pawn, Color::White) => "♙", (Role::Pawn, Color::Black) => "♟",
-        (Role::Knight, Color::White) => "♘", (Role::Knight, Color::Black) => "♞",
-        (Role::Bishop, Color::White) => "♗", (Role::Bishop, Color::Black) => "♝",
-        (Role::Rook, Color::White) => "♖", (Role::Rook, Color::Black) => "♜",
-        (Role::Queen, Color::White) => "♕", (Role::Queen, Color::Black) => "♛",
-        (Role::King, Color::White) => "♔", (Role::King, Color::Black) => "♚",
-    }
+#[derive(Parser, Debug)]
+#[command(author, version, about = "A Rust-based AlphaZero implementation for Chess.", long_about = None)]
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-/// Prints the board to the console with Unicode characters and colors.
-fn print_board(pos: &Chess) {
-    println!("\n     a  b  c  d  e  f  g  h");
-    println!("   +------------------------+");
-    for rank_idx in (0..8).rev() {
-        print!(" {} |", rank_idx + 1);
-        for file_idx in 0..8 {
-            let bg_color = if (rank_idx + file_idx) % 2 == 0 { DARK_SQUARE_BG } else { LIGHT_SQUARE_BG };
-            let square = Square::from_coords(File::new(file_idx), Rank::new(rank_idx));
-            
-            let symbol = match pos.board().piece_at(square) {
-                Some(piece) => get_piece_symbol(&piece),
-                None => " ",
-            };
-            
-            print!("{} {} {}", bg_color, symbol, RESET_COLOR);
-        }
-        println!("| {}", rank_idx + 1);
-    }
-    println!("   +------------------------+");
-    println!("     a  b  c  d  e  f  g  h\n");
-}
-
-// --- VISUAL ENHANCEMENTS END HERE ---
-// The rest of the code is your version, untouched.
-
-/// Prompts the user for a move and returns a legal move if one is entered.
-fn get_player_move(pos: &Chess) -> Move {
-    loop {
-        print!("Your move (e.g., e2e4, g1f3, e7e8q for promotion): ");
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).expect("Failed to read line");
-
-        let input = input.trim();
-        
-        match UciMove::from_str(input) {
-            Ok(uci) => {
-                match uci.to_move(pos) {
-                    Ok(legal_move) => return legal_move,
-                    Err(_) => println!("That's an illegal move. Try again."),
-                }
-            }
-            Err(_) => {
-                println!("Invalid move format. Please use UCI format (e.g., 'e2e4').");
-            }
-        }
-    }
-}
-
-// We use centipawns to avoid floating point numbers. 100 centipawns = 1 pawn.
-const PAWN_VALUE: i32 = 100;
-const KNIGHT_VALUE: i32 = 320;
-const BISHOP_VALUE: i32 = 330;
-const ROOK_VALUE: i32 = 500;
-const QUEEN_VALUE: i32 = 900;
-const MATE_SCORE: i32 = 20000;
-
-
-fn evaluate_material(pos: &Chess) -> i32 {
-    let board = pos.board();
-    let mut score = 0;
-    let us = pos.turn();
-    let them = !us;
-
-    for (role, value) in [(Role::Pawn, PAWN_VALUE), (Role::Knight, KNIGHT_VALUE), (Role::Bishop, BISHOP_VALUE), (Role::Rook, ROOK_VALUE), (Role::Queen, QUEEN_VALUE)] {
-        score += (*board.material_side(us).get(role) as i32) * value;
-        score -= (*board.material_side(them).get(role) as i32) * value;
-    }
-    score
-}
-
-/// The recursive Negamax function.
-/// Returns the score of the position from the perspective of the current player to move.
-fn negamax(pos: &Chess, depth: u8) -> i32 {
-    // Base case: if we've reached max depth or the game is over
-    if depth == 0 || pos.is_game_over() {
-        // Handle checkmate/stalemate explicitly
-        let outcome = pos.outcome();
-        if outcome.is_known() {
-            if let Some(_) = outcome.winner() {
-                // We have been checkmated, which is the worst possible outcome.
-                // We add the depth to the score to prefer longer mates.
-                return -MATE_SCORE - (depth as i32); 
-            }
-            else {
-                return 0; // A draw is a neutral score
-            }
-        }
-
-        // Otherwise, return the static material evaluation
-        return evaluate_material(pos);
-    }
-
-    let mut max = i32::MIN;
-    let legal_moves = pos.legal_moves();
-
-    // Go through each legal move
-    for m in legal_moves {
-        let mut child_pos = pos.clone();
-        child_pos.play_unchecked(m);
-        // The score is the opposite of the opponent's best score
-        let score = -negamax(&child_pos, depth - 1);
-        if score > max {
-            max = score;
-        }
-    }
-    max
-}
-
-
-/// The top-level function that initiates the search.
-fn get_ai_move(pos: &Chess, depth: u8) -> Option<Move> {
-    let legal_moves = pos.legal_moves();
-    if legal_moves.is_empty() {
-        return None;
-    }
-
-    let mut best_score = i32::MIN;
-    // We'll store all moves that result in the best score to add some variety.
-    let mut best_moves: Vec<Move> = Vec::new();
-
-    for m in legal_moves {
-        let mut temp_pos = pos.clone();
-        temp_pos.play_unchecked(m);
-        // The score is from the opponent's perspective, so we negate it to get our score.
-        let score = -negamax(&temp_pos, depth - 1);
-
-        if score > best_score {
-            best_score = score;
-            best_moves.clear();
-            best_moves.push(m.clone());
-        } else if score == best_score {
-            best_moves.push(m.clone());
-        }
-    }
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Train a new model from scratch
+    Train,
     
-    // Choose randomly from the set of best moves.
-    best_moves.choose(&mut rand::rng()).cloned()
+    /// Play against an opponent in the terminal
+    Play {
+        /// The opponent to play against. Can be a path to a model file, or one of: "Human", "MiniMax", "Random"
+        opponent: String,
+    },
+
+    /// Compute Elo ratings for a list of players
+    Elo {
+        /// Player identifiers to be rated. Can be a path to a model file, or one of: "Random", "MiniMax"
+        #[arg(required = true, num_args = 1..)]
+        players: Vec<String>,
+
+        /// The fixed Elo rating of the first player
+        #[arg(required = true, long)]
+        initial_elo: f32,
+    },
 }
-
-
 
 fn main() {
-    let mut game = Chess::default();
+    let cli = Cli::parse();
 
-    loop {
-        print_board(&game);
-
-        if game.is_game_over() {
-            println!("Game Over!");
-            let outcome = game.outcome();
-            if outcome.is_known() {
-                match outcome.winner() {
-                    Some(color) => println!("{} wins!", color),
-                    None => println!("It's a draw!"),
-                }
-            }
-            break;
+    match &cli.command {
+        Commands::Train => {
+            println!("Mode: Training");
+            train::<Autodiff<Cuda>>();
         }
 
-        match game.turn() {
-            Color::White => {
-                println!("It's your turn (White).");
-                let player_move = get_player_move(&game);
-                // Using game.play_unchecked(player_move) as per your code
-                game.play_unchecked(player_move);
-            }
-            Color::Black => {
-                println!("It's the AI's turn (Black).");
-                if let Some(ai_move) = get_ai_move(&game, SEARCH_DEPTH) {
-                    println!("AI plays: {}", ai_move.to_string());
-                    // Using game.play_unchecked(ai_move) as per your code
-                    game.play_unchecked(ai_move);
-                }
-            }
+        Commands::Play { opponent } => {
+            println!("Mode: Play against AI");
+            println!("Loading opponent: {}", opponent);
+            play_against_model::<Cuda>(opponent);
+        }
+
+        Commands::Elo { players, initial_elo} => {
+            println!("Mode: Compute Elo Rankings");
+            println!("Rating {} players...", players.len());
+            
+            let runtime = runtime::Builder::new_multi_thread()
+                .worker_threads(NUM_THREADS)
+                .enable_all()
+                .build()
+                .expect("Unable to build async runtime!");
+
+            let player_pool: Vec<Player<Cuda>> = players
+                .iter()
+                .map(|identifier| {
+                    println!("- Preparing player: {}", identifier);
+                    create_player(identifier)
+                })
+                .collect();
+            
+            compute_elo_rankings(player_pool, *initial_elo, &runtime, true);
         }
     }
+}
+
+pub fn create_player<B: Backend>(identifier: &str) -> Player<B> {
+    match identifier {
+        "Random" => Player::Random,
+        "MiniMax" => Player::MiniMax(4),
+        "Human" => panic!("A 'Human' player cannot be used in Elo computation."),
+        model_path => Player::MctsModel(load_model(model_path)),
+    }
+}
+
+fn load_model<B: Backend>(model_path: &str) -> AlphaZero<B> {
+    let record = NamedMpkFileRecorder::<FullPrecisionSettings>::new()
+        .load(model_path.into(), &B::Device::default())
+        .expect("Should be able to load the model weights from the provided file");
+
+    let model = AlphaZero::<B>::new().load_record(record);
+    model
 }

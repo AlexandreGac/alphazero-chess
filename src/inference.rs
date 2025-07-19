@@ -1,6 +1,6 @@
 use burn::prelude::Backend;
 
-use crate::{create_player, validation::{play_one_game, Player}};
+use crate::{create_player, parameters::TEMPERATURE_ANNEALING, validation::{play_one_game, Player}};
 
 pub fn play_against_model<B: Backend>(model_path: &String) {
     let opponent = create_player::<B>(&model_path);
@@ -10,9 +10,9 @@ pub fn play_against_model<B: Backend>(model_path: &String) {
 
     let human_start = true;
     let result = if human_start {
-        play_one_game(&human_player, &opponent, 6)
+        play_one_game(&human_player, &opponent, TEMPERATURE_ANNEALING)
     } else {
-        -play_one_game(&opponent, &human_player, 6)
+        -play_one_game(&opponent, &human_player, TEMPERATURE_ANNEALING)
     };
 
     if result > 0.0 {

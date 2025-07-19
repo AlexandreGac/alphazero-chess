@@ -1,43 +1,43 @@
-use core::time;
-use std::{collections::HashMap, sync::Arc, thread, time::Instant, vec};
+use std::{collections::HashMap, sync::Arc, thread, time::{self, Instant}, vec};
 
 use burn::{grad_clipping::GradientClippingConfig, module::{AutodiffModule, Module}, optim::{AdamWConfig, GradientsParams, Optimizer}, prelude::Backend, record::{FullPrecisionSettings, NamedMpkFileRecorder}, tensor::{backend::AutodiffBackend, cast::ToElement, Tensor}};
 use rand::prelude::*;
-use rand::distr::weighted::WeightedIndex;
+use rand::distributions::weighted::WeightedIndex;
+use shakmaty::{Chess, Color, Position};
 use tokio::{runtime, sync::{mpsc::{self, UnboundedSender}, oneshot::Sender, RwLock}, task::JoinSet};
 
-use crate::{agent::AlphaZero, connect4::Connect4, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ReplayBuffer, ReplaySampleWithPrediction}, parameters::{BASE_LEARNING_RATE, BATCH_SIZE, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
+use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ChessStateKey, ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
 
 pub struct EpisodeStep {
-    pub state: Connect4,
-    pub improved_policy: [f32; 7],
+    pub state: Chess,
+    pub improved_policy: Box<[f32; ACTION_SPACE]>,
     pub final_value: f32,
     pub search_depth: usize
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct CacheEntry {
-    pub policy: [f32; 7],
+    pub policy: Box<[f32; ACTION_SPACE]>,
     pub value: f32,
 }
 
 pub struct InferenceRequest {
-    pub state: Connect4,
+    pub state: Chess,
     pub response_sender: Sender<InferenceResult>,
 }
 
 
 #[derive(Debug)]
 pub struct InferenceResult {
-    pub policy: [f32; 7],
+    pub policy: Box<[f32; ACTION_SPACE]>,
     pub value: f32,
 }
 
-pub type PriorsCache = Arc<RwLock<HashMap<[[i32; 6]; 7], CacheEntry>>>;
+pub type PriorsCache = Arc<RwLock<HashMap<ChessStateKey, CacheEntry>>>;
 
 pub fn train<B: AutodiffBackend>() {
     B::seed(SEED);
-    let mut rng = rand::rng();
+    let mut rng = thread_rng();
     let logger = TuiLogger::new();
     let runtime = runtime::Builder::new_multi_thread()
         .worker_threads(NUM_THREADS)
@@ -45,8 +45,9 @@ pub fn train<B: AutodiffBackend>() {
         .build()
         .expect("Enable to build async runtime!");
 
-    let mut model = AlphaZero::<B>::new();
-    let evaluator = load_model::<B>("artifacts/evaluator/evaluator_elo_716.mpk");
+    let mut model = load_model::<B>("artifacts/models_run_2/iteration_35_elo_163.mpk");
+    //let mut model = AlphaZero::<B>::new();
+    //let evaluator = load_model::<B>("artifacts/evaluator/evaluator_elo_716.mpk");
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Value(1.0)))
@@ -74,9 +75,6 @@ pub fn train<B: AutodiffBackend>() {
             let len_new_steps = new_steps.len() as f32;
             for step in new_steps {
                 avg_search_depth += step.search_depth as f32;
-                
-                let symmetric_step = generate_symmetry(&step);
-                new_unique_states += replay_buffer.add(symmetric_step);
                 new_unique_states += replay_buffer.add(step);
             }
             avg_search_depth /= len_new_steps;
@@ -110,11 +108,11 @@ pub fn train<B: AutodiffBackend>() {
         for batch_number in 0..NUM_TRAIN_STEPS {
             let batch = replay_buffer.sample(BATCH_SIZE, &mut rng);
             let states = batch.iter().map(|e|
-                e.state.to_tensor::<B>()
+                to_tensor(&e.state)
             ).collect::<Vec<_>>();
 
             let target_policies = batch.iter()
-                .map(|e| Tensor::<B, 1>::from_floats(e.policy, &B::Device::default()))
+                .map(|e| Tensor::<B, 1>::from_floats(*e.policy, &B::Device::default()))
                 .map(|tensor| tensor.unsqueeze::<2>())
                 .collect::<Vec<_>>();
 
@@ -136,9 +134,10 @@ pub fn train<B: AutodiffBackend>() {
                     p.into_data()
                         .to_vec()
                         .unwrap()
+                        .into_boxed_slice()
                         .try_into()
                         .unwrap()
-                }).collect::<Vec<[f32; 7]>>();
+                }).collect::<Vec<Box<[f32; ACTION_SPACE]>>>();
 
                 let predicted_values = predicted_value_tensor.clone().iter_dim(0).map(|v| {
                     v.into_scalar().to_f32()
@@ -205,7 +204,8 @@ pub fn train<B: AutodiffBackend>() {
 
             let start = Instant::now();
             let players = vec![
-                Player::BaseModel(evaluator.valid()),
+                //Player::BaseModel(evaluator.valid()),
+                Player::MiniMax(3),
                 Player::BaseModel(model.valid())
             ];
             let model_index = players.len() - 1;
@@ -221,15 +221,17 @@ pub fn train<B: AutodiffBackend>() {
                 avg_batch_size,
             });
 
-            let opponent = Player::MiniMax(4);
-            if iteration % 2 == 0 {
-                if let Some(sampled_tree) = sample_search_tree(&Player::MctsModel(model.valid()), &opponent, 6) {
-                    logger.log(MetricUpdate::MctsTree(sampled_tree));
+            if iteration % 3 == 0 {
+                let opponent = Player::MiniMax(4);
+                if iteration % 2 == 0 {
+                    if let Some(sampled_tree) = sample_search_tree(&Player::MctsModel(model.valid()), &opponent, 6) {
+                        logger.log(MetricUpdate::MctsTree(sampled_tree));
+                    }
                 }
-            }
-            else {
-                if let Some(sampled_tree) = sample_search_tree(&opponent, &Player::MctsModel(model.valid()), 6) {
-                    logger.log(MetricUpdate::MctsTree(sampled_tree));
+                else {
+                    if let Some(sampled_tree) = sample_search_tree(&opponent, &Player::MctsModel(model.valid()), 6) {
+                        logger.log(MetricUpdate::MctsTree(sampled_tree));
+                    }
                 }
             }
 
@@ -258,22 +260,22 @@ fn compute_gradients<B: AutodiffBackend>(
 }
 
 async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache) -> Vec<EpisodeStep> {
-    let mut game = Connect4::new();
+    let mut game = Chess::new();
     let mut history = vec![];
 
     let result = loop {
         let improved_policy = search_tree.async_monte_carlo_tree_search(sender, cache).await;
         let search_depth = search_tree.max_subtree_depth();
-        let turn = game.get_turn();
+        let turn = if game.turn() == Color::White { 1.0 } else { -1.0 };
 
         history.push(EpisodeStep {
             state: game.clone(),
-            improved_policy,
+            improved_policy: improved_policy.clone(),
             final_value: turn,
             search_depth
         });
 
-        let action_index = if game.get_total_moves() >= TEMPERATURE_ANNEALING {
+        let action_index = if game.fullmoves().get() >= TEMPERATURE_ANNEALING {
             improved_policy
                 .iter()
                 .enumerate()
@@ -282,13 +284,14 @@ async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<Inference
                 .unwrap()
         }
         else {
-            let distribution = WeightedIndex::new(&improved_policy).unwrap();
-            distribution.sample(&mut rand::rng())
+            let distribution = WeightedIndex::new(*improved_policy).unwrap();
+            distribution.sample(&mut thread_rng())
         };
 
-        match game.play(action_index) {
-            Ok("Game in progress") => search_tree = search_tree.traverse_new(action_index, true),
-            Ok("Draw") => break 0.0,
+        let action = index_to_move(action_index, &game).expect("The model played an illegal move!");
+        match play_move(&mut game, action) {
+            Ok(GameResult::Ongoing) => search_tree = search_tree.traverse_new(action_index, true),
+            Ok(GameResult::Draw) => break 0.0,
             Ok(_) => break turn,
             Err(_) => panic!("The model played an illegal move!")
         }
@@ -305,8 +308,8 @@ async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<Episode
     let (sender, mut receiver) = mpsc::unbounded_channel::<InferenceRequest>();
     let cache: PriorsCache = Arc::new(RwLock::new(HashMap::new()));
 
-    let game = Connect4::new();
-    let (policy_tensor, _value_tensor) = model.forward(game.to_tensor());
+    let game = Chess::new();
+    let (policy_tensor, _value_tensor) = model.forward(to_tensor(&game));
     let policy = policy_tensor.into_data()
         .into_vec()
         .unwrap()
@@ -330,7 +333,7 @@ async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<Episode
     let mut avg_batch_size = 0.0;
     let mut requests_batch = vec![];
     
-    while receiver.recv_many(&mut requests_batch, 1024).await > 0 {
+    while receiver.recv_many(&mut requests_batch, BATCH_SIZE).await > 0 {
         num_inferences += 1.0;
         avg_batch_size += process_batch(&mut requests_batch, model, &cache).await;
         thread::sleep(time::Duration::new(0, 1000));
@@ -343,12 +346,13 @@ async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<Episode
 
 pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest>, model: &AlphaZero<B>, cache: &PriorsCache) -> f32 {
     let batch_size = requests_batch.len() as f32;
+
     let states_to_infer = requests_batch.iter()
-        .map(|req| req.state.to_tensor())
+        .map(|req| to_tensor(&req.state))
         .collect::<Vec<_>>();
 
     let raw_states = requests_batch.iter()
-        .map(|req| req.state.get_state())
+        .map(|req| ChessStateKey::new(req.state.clone()))
         .collect::<Vec<_>>();
     
     let response_senders = requests_batch.drain(..)
@@ -363,9 +367,10 @@ pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest
         p.into_data()
             .into_vec()
             .unwrap()
+            .into_boxed_slice()
             .try_into()
             .unwrap()
-    }).collect::<Vec<[f32; 7]>>();
+    }).collect::<Vec<Box<[f32; ACTION_SPACE]>>>();
 
     let values = value_tensor.iter_dim(0).map(|v| {
         v.into_scalar().to_f32()
@@ -374,9 +379,11 @@ pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest
     let mut cache_writer = cache.write().await;
 
     for (i, response_sender) in response_senders.into_iter().enumerate() {
-        cache_writer.insert(raw_states[i], CacheEntry { policy: policies[i], value: values[i] });
+        if cache_writer.len() < CACHE_CAPACITY {
+            cache_writer.insert(raw_states[i].clone(), CacheEntry { policy: policies[i].clone(), value: values[i] });
+        }
         let response = InferenceResult {
-            policy: policies[i],
+            policy: policies[i].clone(),
             value: values[i],
         };
         response_sender.send(response).expect("An error occured!");
@@ -401,17 +408,5 @@ pub fn get_cyclical_lr(iteration: usize) -> f64 {
     } else {
         let progress = (current_iter_in_cycle - HALF_CYCLE) as f64 / HALF_CYCLE as f64;
         max_lr - progress * lr_range
-    }
-}
-
-pub fn generate_symmetry(step: &EpisodeStep) -> EpisodeStep {
-    let mut new_improved_policy = step.improved_policy.clone();
-    new_improved_policy.reverse();
-
-    EpisodeStep {
-        state: step.state.symmetrize(),
-        improved_policy: new_improved_policy,
-        final_value: step.final_value,
-        search_depth: step.search_depth,
     }
 }

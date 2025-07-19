@@ -1,26 +1,46 @@
-use std::collections::{HashMap, VecDeque};
+use std::{collections::{HashMap, VecDeque}, fs::File, io::{BufReader, BufWriter}, path::Path};
 
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rand::prelude::*;
-use ratatui::{layout::{Alignment, Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, text::Line, widgets::{BarChart, Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap}, Frame};
+use ratatui::{layout::{Alignment, Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, widgets::{BarChart, Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap}, Frame};
+use serde::{Deserialize, Serialize};
+use shakmaty::{Chess, Position, Square};
 
-use crate::{connect4::Connect4, logger::TuiState, parameters::REPLAY_BUFFER_SIZE, training::EpisodeStep};
+use crate::{chess::{board_to_text, index_to_move}, logger::TuiState, parameters::{ACTION_SPACE, REPLAY_BUFFER_SIZE}, training::EpisodeStep};
 
 #[derive(Clone, Debug)]
 pub struct TrainingSample {
-    pub state: Connect4,
-    pub policy: [f32; 7],
+    pub state: Chess,
+    pub policy: Box<[f32; ACTION_SPACE]>,
     pub value: f32,
 }
 
+#[derive(Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
+pub struct ChessStateKey {
+    game: Chess,
+    ep_square: Option<Square>
+}
+
+impl ChessStateKey {
+    pub fn new(game: Chess) -> Self {
+        let ep_square = game.legal_ep_square();
+        Self {
+            game, ep_square
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct MemoryEntry {
-    policy: [f32; 7],
+    policy: Box<[f32; ACTION_SPACE]>,
     value: f32,
     visit_count: usize,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct ReplayBuffer {
-    buffer: HashMap<[[i32; 6]; 7], MemoryEntry>,
-    order: VecDeque<Connect4>,
+    buffer: HashMap<ChessStateKey, MemoryEntry>,
+    order: VecDeque<Chess>,
 }
 
 impl ReplayBuffer {
@@ -33,7 +53,9 @@ impl ReplayBuffer {
     }
 
     pub fn add(&mut self, step: EpisodeStep) -> usize {
-        let state_key = step.state.get_state();
+        let state_key = ChessStateKey::new(step.state.clone());
+
+        let x = step.state.fen();
 
         if let Some(entry) = self.buffer.get_mut(&state_key) {
             let old_count = entry.visit_count as f32;
@@ -51,7 +73,8 @@ impl ReplayBuffer {
         } else {
             if self.order.len() >= REPLAY_BUFFER_SIZE {
                 if let Some(oldest_position) = self.order.pop_front() {
-                    self.buffer.remove(&oldest_position.get_state());
+                    let state_key = ChessStateKey::new(oldest_position);
+                    self.buffer.remove(&state_key);
                 }
             }
 
@@ -79,10 +102,11 @@ impl ReplayBuffer {
             .collect::<Vec<_>>()
             .choose_multiple(rng, effective_batch_size)
             .map(|game| {
-                let entry = self.buffer.get(&game.get_state()).expect("Key from `order` should exist in `buffer`");
+                let state_key = ChessStateKey::new((*game).clone());
+                let entry = self.buffer.get(&state_key).expect("Key from `order` should exist in `buffer`");
                 TrainingSample {
                     state: (*game).clone(),
-                    policy: entry.policy,
+                    policy: entry.policy.clone(),
                     value: entry.value,
                 }
             })
@@ -91,6 +115,24 @@ impl ReplayBuffer {
 
     pub fn len(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Saves the ReplayBuffer to a compressed binary file.
+    pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let file = File::create(path)?;
+        let writer = BufWriter::new(file);
+        let encoder = &mut GzEncoder::new(writer, Compression::default());
+        bincode::serde::encode_into_std_write(self, encoder, bincode::config::standard())?;
+        Ok(())
+    }
+
+    /// Loads a ReplayBuffer from a compressed binary file.
+    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = File::open(path)?;
+        let reader = BufReader::new(file);
+        let decoder = &mut GzDecoder::new(reader);
+        let buffer = bincode::serde::decode_from_std_read(decoder, bincode::config::standard())?;
+        Ok(buffer)
     }
 }
 
@@ -102,7 +144,7 @@ impl ReplayBuffer {
 #[derive(Debug, Clone)]
 pub struct ReplaySampleWithPrediction {
     pub sample: TrainingSample,
-    pub predicted_policy: [f32; 7],
+    pub predicted_policy: Box<[f32; ACTION_SPACE]>,
     pub predicted_value: f32
 }
 
@@ -139,14 +181,13 @@ impl ReplayViewerState {
     }
 }
 
-fn render_centered_connect4_board(frame: &mut Frame, area: Rect, state: &Connect4) {
+fn render_centered_board(frame: &mut Frame, area: Rect, state: &Chess) {
     let main_block = Block::default().title("Board State").borders(Borders::ALL);
     let inner_area = main_block.inner(area);
     frame.render_widget(main_block, area);
     
-    let board_text = state.to_string();
-    let board_lines: Vec<Line> = board_text.lines().map(Line::from).collect();
-    let board_height = board_lines.len() as u16;
+    let board_text = board_to_text(state);
+    let board_height = board_text.height() as u16;
 
     let vertical_center_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -157,7 +198,7 @@ fn render_centered_connect4_board(frame: &mut Frame, area: Rect, state: &Connect
         ])
         .split(inner_area);
 
-    let board_paragraph = Paragraph::new(board_lines)
+    let board_paragraph = Paragraph::new(board_text)
         .alignment(Alignment::Center);
 
     frame.render_widget(board_paragraph, vertical_center_layout[1]);
@@ -176,7 +217,7 @@ fn render_replay_buffer_list(frame: &mut Frame, area: Rect, state: &mut TuiState
         .bottom_margin(1);
 
     let rows = state.replay_buffer_sample.iter().enumerate().map(|(i, data)| {
-        let turn_char = if data.sample.state.get_turn() > 0.0 { "X" } else { "O" };
+        let turn_char = if data.sample.state.turn().is_white() { "W" } else { "B" };
         Row::new(vec![
             Cell::from(i.to_string()),
             Cell::from(format!("{:.2}", data.sample.value)),
@@ -235,40 +276,68 @@ pub fn render_replay_buffer_panel(frame: &mut Frame, area: Rect, state: &mut Tui
         .and_then(|i| state.replay_buffer_sample.get(i));
     
     if let Some(data) = selected_data {
-        render_centered_connect4_board(frame, board_area, &data.sample.state);
+        render_centered_board(frame, board_area, &data.sample.state);
         
         let bottom_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(bottom_panel_area);
 
-        const POLICY_LABELS: [&'static str; 7] = ["0", "1", "2", "3", "4", "5", "6"];
+        const TOP_MOVES_TO_SHOW: usize = 7;
 
-        let target_policy_data: Vec<(&str, u64)> = POLICY_LABELS.iter()
-            .zip(data.sample.policy.iter())
-            .map(|(label, p)| (*label, (p * 100.0).round() as u64))
+        let mut top_target_moves = data.sample.policy.iter().enumerate().collect::<Vec<_>>();
+        top_target_moves.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        
+        let target_labels: Vec<String> = top_target_moves.iter()
+            .take(TOP_MOVES_TO_SHOW)
+            .map(|(idx, _)| index_to_move(*idx, &data.sample.state)
+                .map(|m| format!("{m}"))
+                .unwrap_or(format!("IM{idx}"))
+            )
+            .collect();
+            
+        let target_policy_data: Vec<(&str, u64)> = target_labels.iter()
+            .zip(top_target_moves.iter().take(TOP_MOVES_TO_SHOW))
+            .map(|(label, (_, p))| (label.as_str(), (**p * 100.0).round() as u64))
             .collect();
 
         let target_barchart = BarChart::default()
             .block(Block::default().title("MCTS Policy (Target)").borders(Borders::ALL))
-            .data(&target_policy_data).bar_width(5)
+            .data(&target_policy_data)
+            .bar_width(6) // Reduced width for potentially wider labels
+            .bar_gap(2)
             .bar_style(Style::default().fg(Color::Cyan))
             .value_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-            .label_style(Style::default().fg(Color::White)).max(100);
+            .label_style(Style::default().fg(Color::White))
+            .max(100);
         
         frame.render_widget(target_barchart, bottom_chunks[0]);
 
-        let predicted_policy_data: Vec<(&str, u64)> = POLICY_LABELS.iter()
-            .zip(data.predicted_policy.iter())
-            .map(|(label, p)| (*label, (p * 100.0).round() as u64))
+        let mut top_predicted_moves = data.predicted_policy.iter().enumerate().collect::<Vec<_>>();
+        top_predicted_moves.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+
+        let predicted_labels: Vec<String> = top_predicted_moves.iter()
+            .take(TOP_MOVES_TO_SHOW)
+            .map(|(idx, _)| index_to_move(*idx, &data.sample.state)
+                .map(|m| format!("{m}"))
+                .unwrap_or(format!("IM{idx}"))
+            )
+            .collect();
+
+        let predicted_policy_data: Vec<(&str, u64)> = predicted_labels.iter()
+            .zip(top_predicted_moves.iter().take(TOP_MOVES_TO_SHOW))
+            .map(|(label, (_, p))| (label.as_str(), (**p * 100.0).round() as u64))
             .collect();
         
         let predicted_barchart = BarChart::default()
             .block(Block::default().title("Model Policy (Prediction)").borders(Borders::ALL))
-            .data(&predicted_policy_data).bar_width(5)
+            .data(&predicted_policy_data)
+            .bar_width(6)
+            .bar_gap(2)
             .bar_style(Style::default().fg(Color::Magenta))
             .value_style(Style::default().fg(Color::Black).bg(Color::Magenta))
-            .label_style(Style::default().fg(Color::White)).max(100);
+            .label_style(Style::default().fg(Color::White))
+            .max(100);
 
         frame.render_widget(predicted_barchart, bottom_chunks[1]);
     } else {

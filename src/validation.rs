@@ -1,9 +1,10 @@
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, io::{self, Write}, str::FromStr, sync::Arc};
 
-use crate::{agent::AlphaZero, connect4::Connect4, parameters::EVALUATION_GAMES, training::{process_batch, InferenceRequest, InferenceResult, PriorsCache}, tree::MCTree};
+use crate::{agent::AlphaZero, chess::{board_to_string, get_best_move, index_to_move, move_to_index, play_move, to_tensor, GameResult}, memory::ChessStateKey, parameters::{ACTION_SPACE, BATCH_SIZE, EVALUATION_GAMES, TEMPERATURE_ANNEALING}, training::{process_batch, InferenceRequest, InferenceResult, PriorsCache}, tree::MCTree};
 use burn::prelude::*;
 use rand::prelude::*;
-use rand::{distr::weighted::WeightedIndex, seq::IndexedRandom};
+use rand::distributions::weighted::WeightedIndex;
+use shakmaty::{uci::UciMove, Chess, Color, Position};
 use tokio::{sync::{mpsc::{self, UnboundedSender}, oneshot::channel, RwLock}, task::JoinSet};
 
 pub struct EvaluationResult {
@@ -23,13 +24,13 @@ pub enum Player<B: Backend> {
     Human,
 }
 
-pub fn play_one_game<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_stochastic_moves: usize) -> f32 {
-    let mut game = Connect4::new();
-    let mut rng = rand::rng();
+pub fn play_one_game<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_stochastic_moves: u32) -> f32 {
+    let mut game = Chess::new();
+    let mut rng = thread_rng();
     let players = [player1, player2];
 
     loop {
-        let current_player_idx = if game.get_turn() > 0.0 { 0 } else { 1 };
+        let current_player_idx = if game.turn() == Color::White { 0 } else { 1 };
         let current_player = players[current_player_idx];
 
         let action_index = match current_player {
@@ -37,7 +38,7 @@ pub fn play_one_game<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_s
                 let mut search_tree = MCTree::init(model, game.clone(), false);
                 let improved_policy = search_tree.monte_carlo_tree_search(model);
 
-                if game.get_total_moves() >= num_stochastic_moves {
+                if game.fullmoves().get() > num_stochastic_moves {
                     improved_policy
                         .iter()
                         .enumerate()
@@ -46,26 +47,30 @@ pub fn play_one_game<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_s
                         .unwrap()
                 }
                 else {
-                    let distribution = WeightedIndex::new(&improved_policy).unwrap();
+                    let distribution = WeightedIndex::new(*improved_policy).unwrap();
                     distribution.sample(&mut rng)
                 }
             }
             Player::BaseModel(model) => {
-                let legal_moves = game.get_legal_moves();
-                let (policy_tensor, _value_tensor) = model.forward(game.to_tensor());
-                let mut policy: [f32; 7] = policy_tensor.into_data()
+                let legal_moves = game.legal_moves()
+                    .iter()
+                    .map(|m| move_to_index(m, game.turn()))
+                    .collect::<Vec<_>>();
+
+                let (policy_tensor, _value_tensor) = model.forward(to_tensor(&game));
+                let mut policy: [f32; ACTION_SPACE] = policy_tensor.into_data()
                     .into_vec()
                     .unwrap()
                     .try_into()
                     .unwrap();
 
-                for i in 0..7 {
+                for i in 0..ACTION_SPACE {
                     if !legal_moves.contains(&i) {
                         policy[i] = 0.0;
                     }
                 }
 
-                if game.get_total_moves() >= num_stochastic_moves {
+                if game.fullmoves().get() > num_stochastic_moves {
                     policy
                         .iter()
                         .enumerate()
@@ -78,48 +83,52 @@ pub fn play_one_game<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_s
                 }
             }
             Player::Human => {
-                game.display();
-                let legal_moves = game.get_legal_moves();
-                let current_player_symbol = if game.get_turn() == 1.0 { 'X' } else { 'O' };
-                println!("Turn: Player {}", current_player_symbol);
-                println!("Enter column (0-6): ");
+                println!("{}", board_to_string(&game));
 
-                loop {
+                let action = loop {
+                    print!("Your move (e.g., e2e4, g1f3, e7e8q for promotion): ");
+                    io::stdout().flush().unwrap();
+
                     let mut input = String::new();
                     io::stdin().read_line(&mut input).expect("Failed to read line");
-                    match input.trim().parse::<usize>() {
-                        Ok(num) => {
-                            if num <= 6 {
-                                if legal_moves.contains(&num) {
-                                    println!("");
-                                    break num
-                                }
-                                else {
-                                    println!("You made an illegal move!");
-                                }
-                            } else {
-                                println!("Invalid column. Please enter a number between 0 and 6.");
+
+                    let input = input.trim();
+                    
+                    match UciMove::from_str(input) {
+                        Ok(uci) => {
+                            match uci.to_move(&game) {
+                                Ok(legal_move) => break legal_move,
+                                Err(_) => println!("That's an illegal move. Try again."),
                             }
                         }
                         Err(_) => {
-                            println!("Invalid input. Please enter a number.");
+                            println!("Invalid move format. Please use UCI format (e.g., 'e2e4').");
                         }
                     }
-                }
+                };
+
+                move_to_index(&action, game.turn())
             }
             Player::MiniMax(n) => {
-                game.find_best_move(*n).expect("No best move found!")
+                move_to_index(
+                    &get_best_move(&game, *n).expect("No best move found!"),
+                    game.turn()
+                )
             }
             Player::Random => {
-                let legal_moves = game.get_legal_moves();
+                let legal_moves = game.legal_moves()
+                    .iter()
+                    .map(|m| move_to_index(m, game.turn()))
+                    .collect::<Vec<_>>();
                 *legal_moves.choose(&mut rng).unwrap()
             }
         };
 
-        match game.play(action_index) {
-            Ok("Draw") => return 0.0,
-            Ok("P1 Win") => return 1.0,
-            Ok("P2 Win") => return -1.0,
+        let action = index_to_move(action_index, &game).expect("Invalid move!");
+        match play_move(&mut game, action) {
+            Ok(GameResult::Draw) => return 0.0,
+            Ok(GameResult::WhiteWins) => return 1.0,
+            Ok(GameResult::BlackWins) => return -1.0,
             Err(_) => {
                 let player_name = match current_player {
                     Player::MiniMax(_) => "MiniMax Bot",
@@ -184,9 +193,9 @@ pub async fn evaluate<B: Backend>(player_1: &Player<B>, player_2: &Player<B>) ->
 
         tasks.spawn(async move {
            if i % 2 == 0 {
-                play_evaluation_game(&async_player_1, &async_player_2, 6).await
+                play_evaluation_game(&async_player_1, &async_player_2, TEMPERATURE_ANNEALING).await
             } else {
-                -play_evaluation_game(&async_player_2, &async_player_1, 6).await
+                -play_evaluation_game(&async_player_2, &async_player_1, TEMPERATURE_ANNEALING).await
             }
         });
     }
@@ -202,7 +211,7 @@ pub async fn evaluate<B: Backend>(player_1: &Player<B>, player_2: &Player<B>) ->
     let mut requests_batch_2 = vec![];
     while !(finished_1 && finished_2) {
         tokio::select! {
-            received = receiver_1.recv_many(&mut requests_batch_1, 1024) => {
+            received = receiver_1.recv_many(&mut requests_batch_1, BATCH_SIZE) => {
                 if received > 0 {
                     match player_1 {
                         Player::MctsModel(model_1) => {
@@ -220,7 +229,7 @@ pub async fn evaluate<B: Backend>(player_1: &Player<B>, player_2: &Player<B>) ->
                     finished_1 = true;
                 }
             },
-            received = receiver_2.recv_many(&mut requests_batch_2, 1024) => {
+            received = receiver_2.recv_many(&mut requests_batch_2, BATCH_SIZE) => {
                 if received > 0 {
                     match player_2 {
                         Player::MctsModel(model_2) => {
@@ -271,12 +280,12 @@ pub async fn evaluate<B: Backend>(player_1: &Player<B>, player_2: &Player<B>) ->
     }
 }
 
-async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, num_stochastic_moves: usize) -> f32 {
-    let mut game = Connect4::new();
+async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, num_stochastic_moves: u32) -> f32 {
+    let mut game = Chess::new();
     let players = [player_1, player_2];
 
     loop {
-        let current_player_idx = if game.get_turn() > 0.0 { 0 } else { 1 };
+        let current_player_idx = if game.turn() == Color::White { 0 } else { 1 };
         let current_player = players[current_player_idx];
 
         let action_index = match current_player {
@@ -284,7 +293,7 @@ async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, nu
                 let mut search_tree = MCTree::async_init(sender, cache, &game, false).await;
                 let improved_policy = search_tree.async_monte_carlo_tree_search(sender, cache).await;
 
-                if game.get_total_moves() >= num_stochastic_moves {
+                if game.fullmoves().get() > num_stochastic_moves {
                     improved_policy
                         .iter()
                         .enumerate()
@@ -293,14 +302,15 @@ async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, nu
                         .unwrap()
                 }
                 else {
-                    let distribution = WeightedIndex::new(&improved_policy).unwrap();
-                    distribution.sample(&mut rand::rng())
+                    let distribution = WeightedIndex::new(*improved_policy).unwrap();
+                    distribution.sample(&mut thread_rng())
                 }
             }
             AsyncPlayer::BaseModel(sender, cache) => {
                 let cache_reader = cache.read().await;
-                let mut policy = if let Some(entry) = cache_reader.get(&game.get_state()) {
-                    entry.policy
+                let state_key = ChessStateKey::new(game.clone());
+                let mut policy = if let Some(entry) = cache_reader.get(&state_key) {
+                    entry.policy.clone()
                 }
                 else {
                     drop(cache_reader);
@@ -315,14 +325,18 @@ async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, nu
                     policy
                 };
 
-                let legal_moves = game.get_legal_moves();
-                for i in 0..7 {
+                let legal_moves = game.legal_moves()
+                    .iter()
+                    .map(|m| move_to_index(m, game.turn()))
+                    .collect::<Vec<_>>();
+
+                for i in 0..ACTION_SPACE {
                     if !legal_moves.contains(&i) {
                         policy[i] = 0.0;
                     }
                 }
 
-                if game.get_total_moves() >= num_stochastic_moves {
+                if game.fullmoves().get() > num_stochastic_moves {
                     policy
                         .iter()
                         .enumerate()
@@ -330,32 +344,39 @@ async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, nu
                         .map(|(index, _)| index)
                         .unwrap()
                 } else {
-                    let distribution = match WeightedIndex::new(&policy) {
+                    let distribution = match WeightedIndex::new(*policy) {
                         Ok(dist) => dist,
                         Err(_) => panic!("Distribution creation failed with {policy:?}"),
                     };
-                    distribution.sample(&mut rand::rng())
+                    distribution.sample(&mut thread_rng())
                 }
             }
             AsyncPlayer::MiniMax(n) => {
-                game.find_best_move(*n).expect("No best move found!")
+                move_to_index(
+                    &get_best_move(&game, *n).expect("No best move found!"),
+                    game.turn()
+                )
             }
             AsyncPlayer::Random => {
-                let legal_moves = game.get_legal_moves();
-                *legal_moves.choose(&mut rand::rng()).unwrap()
+                let legal_moves = game.legal_moves()
+                    .iter()
+                    .map(|m| move_to_index(m, game.turn()))
+                    .collect::<Vec<_>>();
+                *legal_moves.choose(&mut thread_rng()).unwrap()
             }
         };
 
-        match game.play(action_index) {
-            Ok("Draw") => return 0.0,
-            Ok("P1 Win") => return 1.0,
-            Ok("P2 Win") => return -1.0,
+        let action = index_to_move(action_index, &game).expect("Invalid move!");
+        match play_move(&mut game, action) {
+            Ok(GameResult::Draw) => return 0.0,
+            Ok(GameResult::WhiteWins) => return 1.0,
+            Ok(GameResult::BlackWins) => return -1.0,
             Err(_) => {
                 let player_name = match current_player {
+                    AsyncPlayer::MiniMax(_) => "MiniMax Bot",
                     AsyncPlayer::MctsModel(_, _) => "MCTS AI",
                     AsyncPlayer::BaseModel(_, _) => "Base AI",
-                    AsyncPlayer::MiniMax(_) => "MiniMax Bot",
-                    AsyncPlayer::Random => "Random Bot"
+                    AsyncPlayer::Random => "Random Bot",
                 };
                 panic!("{} played an illegal move!", player_name);
             }
@@ -364,14 +385,14 @@ async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, nu
     }
 }
 
-pub fn sample_search_tree<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_stochastic_moves: usize) -> Option<MCTree> {
-    let mut game = Connect4::new();
-    let mut rng = rand::rng();
+pub fn sample_search_tree<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_stochastic_moves: u32) -> Option<MCTree> {
+    let mut game = Chess::new();
+    let mut rng = thread_rng();
     let players = [player1, player2];
     let mut model_generated_trees: Vec<MCTree> = Vec::new();
 
     loop {
-        let current_player_idx = if game.get_turn() > 0.0 { 0 } else { 1 };
+        let current_player_idx = if game.turn() == Color::White { 0 } else { 1 };
         let current_player = players[current_player_idx];
 
         let action_index = match current_player {
@@ -380,7 +401,7 @@ pub fn sample_search_tree<B: Backend>(player1: &Player<B>, player2: &Player<B>, 
                 let improved_policy = search_tree.monte_carlo_tree_search(model);
                 model_generated_trees.push(search_tree);
 
-                if game.get_total_moves() >= num_stochastic_moves {
+                if game.fullmoves().get() > num_stochastic_moves {
                     improved_policy
                         .iter()
                         .enumerate()
@@ -389,26 +410,30 @@ pub fn sample_search_tree<B: Backend>(player1: &Player<B>, player2: &Player<B>, 
                         .unwrap()
                 }
                 else {
-                    let distribution = WeightedIndex::new(&improved_policy).unwrap();
+                    let distribution = WeightedIndex::new(*improved_policy).unwrap();
                     distribution.sample(&mut rng)
                 }
             }
             Player::BaseModel(model) => {
-                let legal_moves = game.get_legal_moves();
-                let (policy_tensor, _value_tensor) = model.forward(game.to_tensor());
-                let mut policy: [f32; 7] = policy_tensor.into_data()
+                let legal_moves = game.legal_moves()
+                    .iter()
+                    .map(|m| move_to_index(m, game.turn()))
+                    .collect::<Vec<_>>();
+
+                let (policy_tensor, _value_tensor) = model.forward(to_tensor(&game));
+                let mut policy: [f32; ACTION_SPACE] = policy_tensor.into_data()
                     .into_vec()
                     .unwrap()
                     .try_into()
                     .unwrap();
 
-                for i in 0..7 {
+                for i in 0..ACTION_SPACE {
                     if !legal_moves.contains(&i) {
                         policy[i] = 0.0;
                     }
                 }
 
-                if game.get_total_moves() >= num_stochastic_moves {
+                if game.fullmoves().get() > num_stochastic_moves {
                     policy
                         .iter()
                         .enumerate()
@@ -421,48 +446,52 @@ pub fn sample_search_tree<B: Backend>(player1: &Player<B>, player2: &Player<B>, 
                 }
             }
             Player::Human => {
-                game.display();
-                let legal_moves = game.get_legal_moves();
-                let current_player_symbol = if game.get_turn() == 1.0 { 'X' } else { 'O' };
-                println!("Turn: Player {}", current_player_symbol);
-                println!("Enter column (0-6): ");
+                println!("{}", board_to_string(&game));
 
-                loop {
+                let action = loop {
+                    print!("Your move (e.g., e2e4, g1f3, e7e8q for promotion): ");
+                    io::stdout().flush().unwrap();
+
                     let mut input = String::new();
                     io::stdin().read_line(&mut input).expect("Failed to read line");
-                    match input.trim().parse::<usize>() {
-                        Ok(num) => {
-                            if num <= 6 {
-                                if legal_moves.contains(&num) {
-                                    println!("");
-                                    break num
-                                }
-                                else {
-                                    println!("You made an illegal move!");
-                                }
-                            } else {
-                                println!("Invalid column. Please enter a number between 0 and 6.");
+
+                    let input = input.trim();
+                    
+                    match UciMove::from_str(input) {
+                        Ok(uci) => {
+                            match uci.to_move(&game) {
+                                Ok(legal_move) => break legal_move,
+                                Err(_) => println!("That's an illegal move. Try again."),
                             }
                         }
                         Err(_) => {
-                            println!("Invalid input. Please enter a number.");
+                            println!("Invalid move format. Please use UCI format (e.g., 'e2e4').");
                         }
                     }
-                }
+                };
+
+                move_to_index(&action, game.turn())
             }
             Player::MiniMax(n) => {
-                game.find_best_move(*n).expect("No best move found!")
+                move_to_index(
+                    &get_best_move(&game, *n).expect("No best move found!"),
+                    game.turn()
+                )
             }
             Player::Random => {
-                let legal_moves = game.get_legal_moves();
+                let legal_moves = game.legal_moves()
+                    .iter()
+                    .map(|m| move_to_index(m, game.turn()))
+                    .collect::<Vec<_>>();
                 *legal_moves.choose(&mut rng).unwrap()
             }
         };
 
-        match game.play(action_index) {
-            Ok("Draw") => break,
-            Ok("P1 Win") => break,
-            Ok("P2 Win") => break,
+        let action = index_to_move(action_index, &game).expect("Invalid move!");
+        match play_move(&mut game, action) {
+            Ok(GameResult::Draw) => break,
+            Ok(GameResult::WhiteWins) => break,
+            Ok(GameResult::BlackWins) => break,
             Err(_) => {
                 let player_name = match current_player {
                     Player::MiniMax(_) => "MiniMax Bot",
@@ -480,7 +509,7 @@ pub fn sample_search_tree<B: Backend>(player1: &Player<B>, player2: &Player<B>, 
     if model_generated_trees.is_empty() {
         None
     } else {
-    let index = rng.random_range(0..model_generated_trees.len());
+    let index = rng.gen_range(0..model_generated_trees.len());
         Some(model_generated_trees.remove(index))
     }
 }

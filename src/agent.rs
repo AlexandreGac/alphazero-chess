@@ -54,9 +54,9 @@ pub struct AlphaZero<B: Backend> {
     res_blocks: Vec<ResidualBlock<B>>,
 
     // Policy Head
-    policy_conv: Conv2d<B>,
+    policy_conv_1: Conv2d<B>,
     policy_bn: BatchNorm<B, 2>,
-    policy_linear: Linear<B>,
+    policy_conv_2: Conv2d<B>,
     
     // Value Head
     value_conv: Conv2d<B>,
@@ -68,10 +68,11 @@ pub struct AlphaZero<B: Backend> {
 impl<B: Backend> AlphaZero<B> {
     pub fn new() -> Self {
         let device = B::Device::default();
-        let conv_config = Conv2dConfig::new([2, NUM_FILTERS], [3, 3])
-            .with_padding(PaddingConfig2d::Same);
 
         // --- Initialize Shared Body ---
+        // Input layer is 19 channels * 8 ranks * 8 files (=1216)
+        let conv_config = Conv2dConfig::new([19, NUM_FILTERS], [3, 3])
+            .with_padding(PaddingConfig2d::Same);
         let input_conv = conv_config.init(&device);
         let input_bn = BatchNormConfig::new(NUM_FILTERS).init(&device);
         let mut res_blocks = Vec::with_capacity(NUM_RES_BLOCKS);
@@ -80,25 +81,27 @@ impl<B: Backend> AlphaZero<B> {
         }
 
         // --- Initialize Policy Head ---
-        // Input to linear layer is 16 channels * 7 columns * 6 rows = 672
-        let policy_conv = Conv2dConfig::new([NUM_FILTERS, 16], [1, 1]).init(&device);
-        let policy_bn = BatchNormConfig::new(16).init(&device);
-        let policy_linear = LinearConfig::new(16 * 7 * 6, 7).init(&device);
+        // Input to final convolutional layer is 32 channels * 8 ranks * 8 files (= 2048)
+        let policy_conv_1 = Conv2dConfig::new([NUM_FILTERS, 32], [1, 1]).init(&device);
+        let policy_bn = BatchNormConfig::new(32).init(&device);
+        let policy_conv_2 = Conv2dConfig::new([32, 64], [1, 1]).init(&device);
 
         // --- Initialize Value Head ---
-        // Input to linear layer is 8 channel * 7 columns * 6 rows = 336
+        // Input to linear layer is 8 channels * 8 ranks * 8 files = 512
         let value_conv = Conv2dConfig::new([NUM_FILTERS, 8], [1, 1]).init(&device);
         let value_bn = BatchNormConfig::new(8).init(&device);
-        let value_linear_1 = LinearConfig::new(8 * 6 * 7, 64).init(&device);
+        let value_linear_1 = LinearConfig::new(8 * 8 * 8, 64).init(&device);
         let value_linear_2 = LinearConfig::new(64, 1).init(&device);
 
         Self {
             input_conv,
             input_bn,
             res_blocks,
-            policy_conv,
+
+            policy_conv_1,
             policy_bn,
-            policy_linear,
+            policy_conv_2,
+
             value_conv,
             value_bn,
             value_linear_1,
@@ -117,13 +120,13 @@ impl<B: Backend> AlphaZero<B> {
         let body_output = x;
 
         // --- Policy Head ---
-        let policy = self.policy_conv.forward(body_output.clone());
+        let policy = self.policy_conv_1.forward(body_output.clone());
         let policy = self.policy_bn.forward(policy);
         let policy = relu(policy);
-        let [batch_size, _, _, _] = policy.dims();
-        let policy = policy.reshape([batch_size as i32, -1]);
-        let policy_logits = self.policy_linear.forward(policy);
-        let policy = softmax(policy_logits, 1);
+        let policy_logits = self.policy_conv_2.forward(policy);
+        let [batch_size, _, _, _] = policy_logits.dims();
+        let flat_logits = policy_logits.reshape([batch_size as i32, -1]);
+        let policy = softmax(flat_logits, 1);
 
         // --- Value Head ---
         let value = self.value_conv.forward(body_output);
