@@ -1,12 +1,12 @@
-use std::{collections::HashMap, sync::Arc, thread, time::{self, Instant}, vec};
+use std::{collections::HashMap, path::Path, sync::Arc, thread, time::{self, Instant}, vec};
 
 use burn::{grad_clipping::GradientClippingConfig, module::{AutodiffModule, Module}, optim::{AdamWConfig, GradientsParams, Optimizer}, prelude::Backend, record::{FullPrecisionSettings, NamedMpkFileRecorder}, tensor::{backend::AutodiffBackend, cast::ToElement, Tensor}};
 use rand::prelude::*;
 use rand::distributions::weighted::WeightedIndex;
-use shakmaty::{Chess, Color, Position};
+use shakmaty::{fen::Fen, Chess, Color, EnPassantMode, Position};
 use tokio::{runtime, sync::{mpsc::{self, UnboundedSender}, oneshot::Sender, RwLock}, task::JoinSet};
 
-use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ChessStateKey, ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
+use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
 
 pub struct EpisodeStep {
     pub state: Chess,
@@ -33,9 +33,9 @@ pub struct InferenceResult {
     pub value: f32,
 }
 
-pub type PriorsCache = Arc<RwLock<HashMap<ChessStateKey, CacheEntry>>>;
+pub type PriorsCache = Arc<RwLock<HashMap<Fen, CacheEntry>>>;
 
-pub fn train<B: AutodiffBackend>() {
+pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
     B::seed(SEED);
     let mut rng = thread_rng();
     let logger = TuiLogger::new();
@@ -45,8 +45,18 @@ pub fn train<B: AutodiffBackend>() {
         .build()
         .expect("Enable to build async runtime!");
 
-    let mut model = load_model::<B>("artifacts/models_run_2/iteration_35_elo_163.mpk");
-    //let mut model = AlphaZero::<B>::new();
+    let mut model = if let Some(path) = model_path {
+        load_model::<B>(path)
+    } else {
+        AlphaZero::<B>::new()
+    };
+
+    let mut replay_buffer = if let Some(_) = model_path {
+        ReplayBuffer::load(Path::new("checkpoint/replay_buffer"))
+    } else {
+        ReplayBuffer::new()
+    };
+
     //let evaluator = load_model::<B>("artifacts/evaluator/evaluator_elo_716.mpk");
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     let mut optimizer = AdamWConfig::new()
@@ -55,8 +65,6 @@ pub fn train<B: AutodiffBackend>() {
         .init();
 
     logger.log(MetricUpdate::GeneralLog(format!("Device: {:?}", B::Device::default())));
-
-    let mut replay_buffer = ReplayBuffer::new();
     
     for iteration in 0..NUM_ITERATIONS {
         logger.log(MetricUpdate::IterationStart { iteration });
@@ -233,10 +241,12 @@ pub fn train<B: AutodiffBackend>() {
                         logger.log(MetricUpdate::MctsTree(sampled_tree));
                     }
                 }
+
+                replay_buffer.save(Path::new("checkpoint/replay_buffer"));
             }
 
             let file_path = format!("artifacts/models/iteration_{}_elo_{:.0}.mpk", iteration, new_elo);
-            model.clone().save_file(file_path.clone(), &recorder).expect("Unable to save model!");
+            model.clone().save_file(file_path, &recorder).expect("Unable to save model!");
         }
     }
 
@@ -306,7 +316,7 @@ async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<Inference
 
 async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<EpisodeStep>) {
     let (sender, mut receiver) = mpsc::unbounded_channel::<InferenceRequest>();
-    let cache: PriorsCache = Arc::new(RwLock::new(HashMap::new()));
+    let cache: PriorsCache = Arc::new(RwLock::new(HashMap::with_capacity(CACHE_CAPACITY)));
 
     let game = Chess::new();
     let (policy_tensor, _value_tensor) = model.forward(to_tensor(&game));
@@ -352,7 +362,7 @@ pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest
         .collect::<Vec<_>>();
 
     let raw_states = requests_batch.iter()
-        .map(|req| ChessStateKey::new(req.state.clone()))
+        .map(|req| Fen::from_position(&req.state, EnPassantMode::PseudoLegal))
         .collect::<Vec<_>>();
     
     let response_senders = requests_batch.drain(..)

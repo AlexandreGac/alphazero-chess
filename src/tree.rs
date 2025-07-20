@@ -11,13 +11,13 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
-use shakmaty::{Chess, Position};
+use shakmaty::fen::Fen;
+use shakmaty::{Chess, EnPassantMode, Position};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot::channel;
 
 use crate::agent::AlphaZero;
 use crate::chess::{board_to_text, index_to_move, move_to_index, play_move, to_tensor, GameResult};
-use crate::memory::ChessStateKey;
 use crate::parameters::{ACTION_SPACE, C_PUCT, DIRICHLET_ALPHA, DIRICHLET_EPSILON, NUM_SIMULATIONS, TEMPERATURE};
 use crate::training::{InferenceRequest, InferenceResult, PriorsCache};
 
@@ -63,7 +63,7 @@ impl MCTree {
 
     pub async fn async_init(sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache, game: &Chess, apply_noise: bool) -> Self {
         let cache_reader = cache.read().await;
-        let state_key = ChessStateKey::new(game.clone());
+        let state_key = Fen::from_position(game, EnPassantMode::PseudoLegal);
         if let Some(entry) = cache_reader.get(&state_key) {
             Self::new(*entry.policy, game, apply_noise)
         }
@@ -211,7 +211,7 @@ impl MCTree {
         match play_move(&mut leaf_state, action) {
             Ok(GameResult::Ongoing) => {
                 let cache_reader = cache.read().await;
-                let state_key = ChessStateKey::new(leaf_state.clone());
+                let state_key = Fen::from_position(&leaf_state, EnPassantMode::PseudoLegal);
                 if let Some(entry) = cache_reader.get(&state_key) {
                     self.nodes.insert(max_index, Box::new(Self::new(*entry.policy, &leaf_state, false)));
                     entry.value
@@ -339,7 +339,7 @@ impl TreeViewerState {
         let select_index = self.scroll_state.selected().expect("No raw selected!");
         let action_index = (0..ACTION_SPACE)
             .filter(|&i| current_node.moves.contains(&i) || current_node.policy[i] >= 0.01)
-            .sorted_by_key(|&i| current_node.visits[i] as usize)
+            .sorted_by_key(|&i| -current_node.visits[i] as isize)
             .nth(select_index)
             .expect("Invalid list index");
 
@@ -451,7 +451,7 @@ pub fn draw_stats_table(frame: &mut Frame, area: Rect, state: &mut TreeViewerSta
 
     let rows = (0..ACTION_SPACE)
         .filter(|&i| node.moves.contains(&i) || node.policy[i] >= 0.01)
-        .sorted_by_key(|&i| node.visits[i] as usize)
+        .sorted_by_key(|&i| -node.visits[i] as isize)
         .map(|i| {
             let q_value = if node.visits[i] > 0.0 { node.scores[i] / node.visits[i] } else { 0.0 };
             let n_value = node.visits[i];

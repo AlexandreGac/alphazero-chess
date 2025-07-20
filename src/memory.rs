@@ -4,7 +4,8 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rand::prelude::*;
 use ratatui::{layout::{Alignment, Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, widgets::{BarChart, Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap}, Frame};
 use serde::{Deserialize, Serialize};
-use shakmaty::{Chess, Position, Square};
+use serde_big_array::BigArray;
+use shakmaty::{fen::Fen, CastlingMode, Chess, EnPassantMode, Position};
 
 use crate::{chess::{board_to_text, index_to_move}, logger::TuiState, parameters::{ACTION_SPACE, REPLAY_BUFFER_SIZE}, training::EpisodeStep};
 
@@ -15,32 +16,18 @@ pub struct TrainingSample {
     pub value: f32,
 }
 
-#[derive(Hash, PartialEq, Eq, Clone, Serialize, Deserialize)]
-pub struct ChessStateKey {
-    game: Chess,
-    ep_square: Option<Square>
-}
-
-impl ChessStateKey {
-    pub fn new(game: Chess) -> Self {
-        let ep_square = game.legal_ep_square();
-        Self {
-            game, ep_square
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct MemoryEntry {
-    policy: Box<[f32; ACTION_SPACE]>,
+    #[serde(with = "BigArray")]
+    policy: [f32; ACTION_SPACE],
     value: f32,
     visit_count: usize,
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct ReplayBuffer {
-    buffer: HashMap<ChessStateKey, MemoryEntry>,
-    order: VecDeque<Chess>,
+    buffer: HashMap<Fen, MemoryEntry>,
+    order: VecDeque<Fen>,
 }
 
 impl ReplayBuffer {
@@ -53,9 +40,7 @@ impl ReplayBuffer {
     }
 
     pub fn add(&mut self, step: EpisodeStep) -> usize {
-        let state_key = ChessStateKey::new(step.state.clone());
-
-        let x = step.state.fen();
+        let state_key = Fen::from_position(&step.state, EnPassantMode::PseudoLegal);
 
         if let Some(entry) = self.buffer.get_mut(&state_key) {
             let old_count = entry.visit_count as f32;
@@ -73,19 +58,18 @@ impl ReplayBuffer {
         } else {
             if self.order.len() >= REPLAY_BUFFER_SIZE {
                 if let Some(oldest_position) = self.order.pop_front() {
-                    let state_key = ChessStateKey::new(oldest_position);
-                    self.buffer.remove(&state_key);
+                    self.buffer.remove(&oldest_position);
                 }
             }
 
             let new_entry = MemoryEntry {
-                policy: step.improved_policy,
+                policy: *step.improved_policy,
                 value: step.final_value,
                 visit_count: 1,
             };
 
-            self.buffer.insert(state_key, new_entry);
-            self.order.push_back(step.state);
+            self.buffer.insert(state_key.clone(), new_entry);
+            self.order.push_back(state_key);
             
             1
         }
@@ -102,11 +86,10 @@ impl ReplayBuffer {
             .collect::<Vec<_>>()
             .choose_multiple(rng, effective_batch_size)
             .map(|game| {
-                let state_key = ChessStateKey::new((*game).clone());
-                let entry = self.buffer.get(&state_key).expect("Key from `order` should exist in `buffer`");
+                let entry = self.buffer.get(game).expect("Key from `order` should exist in `buffer`");
                 TrainingSample {
-                    state: (*game).clone(),
-                    policy: entry.policy.clone(),
+                    state: (*game).clone().into_position(CastlingMode::Standard).expect("Unable to create chess board!"),
+                    policy: Box::new(entry.policy.clone()),
                     value: entry.value,
                 }
             })
@@ -117,22 +100,23 @@ impl ReplayBuffer {
         self.buffer.len()
     }
 
-    /// Saves the ReplayBuffer to a compressed binary file.
-    pub fn save(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-        let file = File::create(path)?;
-        let writer = BufWriter::new(file);
-        let encoder = &mut GzEncoder::new(writer, Compression::default());
-        bincode::serde::encode_into_std_write(self, encoder, bincode::config::standard())?;
-        Ok(())
+    /// Saves the ReplayBuffer to a binary file.
+    pub fn save(&self, path: &Path) {
+        let file = File::create(path).expect("File creation error!");
+        let writer = &mut BufWriter::new(file);
+        //let encoder = &mut GzEncoder::new(writer, Compression::fast());
+        bincode::serde::encode_into_std_write(self, writer, bincode::config::standard()).expect("Encoding failed!");
     }
 
-    /// Loads a ReplayBuffer from a compressed binary file.
-    pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let file = File::open(path)?;
-        let reader = BufReader::new(file);
-        let decoder = &mut GzDecoder::new(reader);
-        let buffer = bincode::serde::decode_from_std_read(decoder, bincode::config::standard())?;
-        Ok(buffer)
+    /// Loads a ReplayBuffer from a binary file.
+    pub fn load(path: &Path) -> Self {
+        let file = File::open(path).expect("File does not exist!");
+        let reader = &mut BufReader::new(file);
+        //let decoder = &mut GzDecoder::new(reader);
+        let buffer = bincode::serde::decode_from_std_read(reader, bincode::config::standard())
+            .expect("Decoding failed!");
+
+        buffer
     }
 }
 

@@ -32,7 +32,11 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Train a new model from scratch
-    Train,
+    Train {
+        /// Optional path to a checkpoint directory to resume training from.
+        #[arg(long)]
+        resume: Option<String>,
+    },
     
     /// Play against an opponent in the terminal
     Play {
@@ -56,9 +60,12 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Train => {
+        Commands::Train { resume } => {
             println!("Mode: Training");
-            train::<Autodiff<Cuda>>();
+            if let Some(path) = resume {
+                println!("Attempting to resume from checkpoint: {}", path);
+            }
+            train::<Autodiff<Cuda>>(resume);
         }
 
         Commands::Play { opponent } => {
@@ -67,7 +74,7 @@ fn main() {
             play_against_model::<Cuda>(opponent);
         }
 
-        Commands::Elo { players, initial_elo} => {
+        Commands::Elo { players, initial_elo } => {
             println!("Mode: Compute Elo Rankings");
             println!("Rating {} players...", players.len());
             

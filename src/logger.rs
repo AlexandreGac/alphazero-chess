@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    io::{self, stdout},
+    io,
     sync::{mpsc::{channel, Sender, Receiver}, Arc, Mutex},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -8,8 +8,6 @@ use std::{
 
 use crossterm::{
     event::{self, Event, KeyCode},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
 };
 use ratatui::{
     prelude::*,
@@ -294,10 +292,7 @@ fn run_ui_loop(
     receiver: Receiver<MetricUpdate>,
     state: Arc<Mutex<TuiState>>,
 ) -> io::Result<()> {
-    stdout().execute(EnterAlternateScreen)?;
-    enable_raw_mode()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
-    terminal.clear()?;
+    let mut terminal = ratatui::init();
 
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(33);
@@ -382,8 +377,7 @@ fn run_ui_loop(
         }
     }
 
-    stdout().execute(LeaveAlternateScreen)?;
-    disable_raw_mode()?;
+    ratatui::restore();
     Ok(())
 }
 
