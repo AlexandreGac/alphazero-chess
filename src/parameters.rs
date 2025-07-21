@@ -1,5 +1,5 @@
 pub const ACTION_SPACE: usize = 64 * 8 * 8;
-pub const CACHE_CAPACITY: usize = 100_000;
+pub const CACHE_CAPACITY: u64 = 500_000;
 
 pub const SEED: u64 = 42;
 pub const NUM_RES_BLOCKS: usize = 10;

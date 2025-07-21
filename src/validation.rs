@@ -1,11 +1,12 @@
-use std::{collections::HashMap, io::{self, Write}, str::FromStr, sync::Arc};
+use std::{io::{self, Write}, str::FromStr};
 
-use crate::{agent::AlphaZero, chess::{board_to_string, get_best_move, index_to_move, move_to_index, play_move, to_tensor, GameResult}, parameters::{ACTION_SPACE, BATCH_SIZE, CACHE_CAPACITY, EVALUATION_GAMES, TEMPERATURE_ANNEALING}, training::{process_batch, InferenceRequest, InferenceResult, PriorsCache}, tree::MCTree};
+use crate::{agent::AlphaZero, chess::{board_to_string, get_best_move, index_to_move, move_to_index, play_move, to_tensor, GameResult}, parameters::{ACTION_SPACE, BATCH_SIZE, CACHE_CAPACITY, EVALUATION_GAMES, TEMPERATURE_ANNEALING}, training::{process_batch, CacheEntry, InferenceRequest, InferenceResult}, tree::MCTree};
 use burn::prelude::*;
+use moka::future::Cache;
 use rand::prelude::*;
 use rand::distributions::weighted::WeightedIndex;
 use shakmaty::{fen::Fen, uci::UciMove, Chess, Color, Position};
-use tokio::{sync::{mpsc::{self, UnboundedSender}, oneshot::channel, RwLock}, task::JoinSet};
+use tokio::{sync::{mpsc::{self, UnboundedSender}, oneshot::channel}, task::JoinSet};
 
 pub struct EvaluationResult {
     pub num_inferences: f32,
@@ -145,8 +146,8 @@ pub fn play_one_game<B: Backend>(player1: &Player<B>, player2: &Player<B>, num_s
 }
 
 pub enum AsyncPlayer {
-    MctsModel(UnboundedSender<InferenceRequest>, PriorsCache),
-    BaseModel(UnboundedSender<InferenceRequest>, PriorsCache),
+    MctsModel(UnboundedSender<InferenceRequest>, Cache<Fen, CacheEntry>),
+    BaseModel(UnboundedSender<InferenceRequest>, Cache<Fen, CacheEntry>),
     MiniMax(u32),
     Random
 }
@@ -154,17 +155,17 @@ pub enum AsyncPlayer {
 pub async fn evaluate<B: Backend>(player_1: &Player<B>, player_2: &Player<B>) -> EvaluationResult {
     let (sender_1, mut receiver_1) = mpsc::unbounded_channel::<InferenceRequest>();
     let (sender_2, mut receiver_2) = mpsc::unbounded_channel::<InferenceRequest>();
-    let cache_1: PriorsCache = Arc::new(RwLock::new(HashMap::with_capacity(CACHE_CAPACITY)));
-    let cache_2: PriorsCache = Arc::new(RwLock::new(HashMap::with_capacity(CACHE_CAPACITY)));
+    let cache_1 = Cache::new(CACHE_CAPACITY / 2);
+    let cache_2 = Cache::new(CACHE_CAPACITY / 2);
 
     let mut tasks = JoinSet::new();
     for i in 0..EVALUATION_GAMES {
         let async_player_1 = match player_1 {
             Player::MctsModel(_) => {
-                AsyncPlayer::MctsModel(sender_1.clone(), Arc::clone(&cache_1))
+                AsyncPlayer::MctsModel(sender_1.clone(), cache_1.clone())
             }
             Player::BaseModel(_) => {
-                AsyncPlayer::BaseModel(sender_1.clone(), Arc::clone(&cache_1))
+                AsyncPlayer::BaseModel(sender_1.clone(), cache_1.clone())
             }
             Player::MiniMax(n) => {
                 AsyncPlayer::MiniMax(*n)
@@ -177,10 +178,10 @@ pub async fn evaluate<B: Backend>(player_1: &Player<B>, player_2: &Player<B>) ->
 
         let async_player_2 = match player_2 {
             Player::MctsModel(_) => {
-                AsyncPlayer::MctsModel(sender_2.clone(), Arc::clone(&cache_2))
+                AsyncPlayer::MctsModel(sender_2.clone(), cache_2.clone())
             }
             Player::BaseModel(_) => {
-                AsyncPlayer::BaseModel(sender_2.clone(), Arc::clone(&cache_2))
+                AsyncPlayer::BaseModel(sender_2.clone(), cache_2.clone())
             }
             Player::MiniMax(n) => {
                 AsyncPlayer::MiniMax(*n)
@@ -307,14 +308,11 @@ async fn play_evaluation_game(player_1: &AsyncPlayer, player_2: &AsyncPlayer, nu
                 }
             }
             AsyncPlayer::BaseModel(sender, cache) => {
-                let cache_reader = cache.read().await;
                 let state_key = Fen::from_position(&game, shakmaty::EnPassantMode::PseudoLegal);
-                let mut policy = if let Some(entry) = cache_reader.get(&state_key) {
+                let mut policy = if let Some(entry) = cache.get(&state_key).await {
                     entry.policy.clone()
                 }
                 else {
-                    drop(cache_reader);
-
                     let (response_sender, response_receiver) = channel();
                     sender.send(InferenceRequest {
                         state: game.clone(),

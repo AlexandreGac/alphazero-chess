@@ -4,6 +4,7 @@ use std::iter;
 use burn::prelude::*;
 use burn::tensor::cast::ToElement;
 use itertools::Itertools;
+use moka::future::Cache;
 use rand::prelude::*;
 use rand_distr::{Dirichlet, Distribution};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -19,7 +20,7 @@ use tokio::sync::oneshot::channel;
 use crate::agent::AlphaZero;
 use crate::chess::{board_to_text, index_to_move, move_to_index, play_move, to_tensor, GameResult};
 use crate::parameters::{ACTION_SPACE, C_PUCT, DIRICHLET_ALPHA, DIRICHLET_EPSILON, NUM_SIMULATIONS, TEMPERATURE};
-use crate::training::{InferenceRequest, InferenceResult, PriorsCache, CACHE_HITS, CACHE_MISSES};
+use crate::training::{CacheEntry, InferenceRequest, InferenceResult, CACHE_HITS, CACHE_MISSES};
 
 #[derive(Debug, Clone)]
 pub struct MCTree {
@@ -61,16 +62,13 @@ impl MCTree {
         }
     }
 
-    pub async fn async_init(sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache, game: &Chess, apply_noise: bool) -> Self {
-        let cache_reader = cache.read().await;
+    pub async fn async_init(sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>, game: &Chess, apply_noise: bool) -> Self {
         let state_key = Fen::from_position(game, EnPassantMode::PseudoLegal);
-        if let Some(entry) = cache_reader.get(&state_key) {
+        if let Some(entry) = cache.get(&state_key).await {
             CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Self::new(*entry.policy, game, apply_noise)
         }
         else {
-            drop(cache_reader);
-
             CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (response_sender, response_receiver) = channel();
             sender.send(InferenceRequest {
@@ -167,7 +165,7 @@ impl MCTree {
         }
     }
 
-    pub async fn async_monte_carlo_tree_search(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache) -> Box<[f32; ACTION_SPACE]> {
+    pub async fn async_monte_carlo_tree_search(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>) -> Box<[f32; ACTION_SPACE]> {
         for _i in 1..=NUM_SIMULATIONS {
             self.async_simulation(sender, cache).await;
         }
@@ -178,7 +176,7 @@ impl MCTree {
         improved_policy.into_boxed_slice().try_into().unwrap()
     }
 
-    async fn async_simulation(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache) -> f32 {
+    async fn async_simulation(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>) -> f32 {
         let mut max_value = f32::NEG_INFINITY;
         let mut max_index = 0;
 
@@ -207,21 +205,18 @@ impl MCTree {
         value
     }
 
-    async fn async_expand(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache, max_index: usize) -> f32 {
+    async fn async_expand(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>, max_index: usize) -> f32 {
         let mut leaf_state = self.state.clone();
         let action = index_to_move(max_index, &leaf_state).expect("Illegal move!");
         match play_move(&mut leaf_state, action) {
             Ok(GameResult::Ongoing) => {
-                let cache_reader = cache.read().await;
                 let state_key = Fen::from_position(&leaf_state, EnPassantMode::PseudoLegal);
-                if let Some(entry) = cache_reader.get(&state_key) {
+                if let Some(entry) = cache.get(&state_key).await {
                     CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.nodes.insert(max_index, Box::new(Self::new(*entry.policy, &leaf_state, false)));
                     entry.value
                 }
                 else {
-                    drop(cache_reader);
-
                     CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (response_sender, response_receiver) = channel();
                     sender.send(InferenceRequest {

@@ -1,10 +1,11 @@
-use std::{collections::HashMap, path::Path, sync::{atomic::AtomicUsize, Arc}, thread, time::{self, Instant}, vec};
+use std::{path::Path, sync::{atomic::AtomicUsize}, thread, time::{self, Instant}, vec};
 
 use burn::{grad_clipping::GradientClippingConfig, module::{AutodiffModule, Module}, optim::{AdamWConfig, GradientsParams, Optimizer}, prelude::Backend, record::{FullPrecisionSettings, NamedMpkFileRecorder}, tensor::{backend::AutodiffBackend, cast::ToElement, Tensor}};
+use moka::future::Cache;
 use rand::prelude::*;
 use rand::distributions::weighted::WeightedIndex;
 use shakmaty::{fen::Fen, Chess, Color, EnPassantMode, Position};
-use tokio::{runtime, sync::{mpsc::{self, UnboundedSender}, oneshot::Sender, RwLock}, task::JoinSet};
+use tokio::{runtime, sync::{mpsc::{self, UnboundedSender}, oneshot::Sender}, task::JoinSet};
 
 use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
 
@@ -35,8 +36,6 @@ pub struct InferenceResult {
     pub policy: Box<[f32; ACTION_SPACE]>,
     pub value: f32,
 }
-
-pub type PriorsCache = Arc<RwLock<HashMap<Fen, CacheEntry>>>;
 
 pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
     B::seed(SEED);
@@ -292,7 +291,7 @@ fn compute_gradients<B: AutodiffBackend>(
     (policy_loss_val, value_loss_val, gradients)
 }
 
-async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<InferenceRequest>, cache: &PriorsCache) -> Vec<EpisodeStep> {
+async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>) -> Vec<EpisodeStep> {
     let mut game = Chess::new();
     let mut history = vec![];
 
@@ -339,7 +338,7 @@ async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<Inference
 
 async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<EpisodeStep>) {
     let (sender, mut receiver) = mpsc::unbounded_channel::<InferenceRequest>();
-    let cache: PriorsCache = Arc::new(RwLock::new(HashMap::with_capacity(CACHE_CAPACITY)));
+    let cache = Cache::new(CACHE_CAPACITY);
 
     let game = Chess::new();
     let (policy_tensor, _value_tensor) = model.forward(to_tensor(&game));
@@ -377,7 +376,7 @@ async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<Episode
     (avg_batch_size, result.into_iter().flatten().collect())
 }
 
-pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest>, model: &AlphaZero<B>, cache: &PriorsCache) -> f32 {
+pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest>, model: &AlphaZero<B>, cache: &Cache<Fen, CacheEntry>) -> f32 {
     let batch_size = requests_batch.len() as f32;
 
     let states_to_infer = requests_batch.iter()
@@ -409,12 +408,8 @@ pub async fn process_batch<B: Backend>(requests_batch: &mut Vec<InferenceRequest
         v.into_scalar().to_f32()
     }).collect::<Vec<f32>>();
 
-    let mut cache_writer = cache.write().await;
-
     for (i, response_sender) in response_senders.into_iter().enumerate() {
-        if cache_writer.len() < CACHE_CAPACITY {
-            cache_writer.insert(raw_states[i].clone(), CacheEntry { policy: policies[i].clone(), value: values[i] });
-        }
+        cache.insert(raw_states[i].clone(), CacheEntry { policy: policies[i].clone(), value: values[i] }).await;
         let response = InferenceResult {
             policy: policies[i].clone(),
             value: values[i],
