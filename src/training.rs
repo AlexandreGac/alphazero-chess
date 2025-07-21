@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Path, sync::Arc, thread, time::{self, Instant}, vec};
+use std::{collections::HashMap, path::Path, sync::{atomic::AtomicUsize, Arc}, thread, time::{self, Instant}, vec};
 
 use burn::{grad_clipping::GradientClippingConfig, module::{AutodiffModule, Module}, optim::{AdamWConfig, GradientsParams, Optimizer}, prelude::Backend, record::{FullPrecisionSettings, NamedMpkFileRecorder}, tensor::{backend::AutodiffBackend, cast::ToElement, Tensor}};
 use rand::prelude::*;
@@ -7,6 +7,9 @@ use shakmaty::{fen::Fen, Chess, Color, EnPassantMode, Position};
 use tokio::{runtime, sync::{mpsc::{self, UnboundedSender}, oneshot::Sender, RwLock}, task::JoinSet};
 
 use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
+
+pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+pub static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
 
 pub struct EpisodeStep {
     pub state: Chess,
@@ -98,6 +101,25 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
 
             break
         }
+
+        let hits = CACHE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let misses = CACHE_MISSES.load(std::sync::atomic::Ordering::Relaxed);
+        let total = hits + misses;
+        let hit_rate = if total > 0 {
+            (hits as f64) / (total as f64)
+        } else {
+            0.0
+        };
+
+        CACHE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        CACHE_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        logger.log(MetricUpdate::GeneralLog(format!(
+            "Cache hit rate: {:.2}% ({} hits / {} total)",
+            hit_rate * 100.0,
+            hits,
+            total
+        )));
 
         logger.log(MetricUpdate::SelfPlayFinished {
             duration: start.elapsed(),
@@ -258,8 +280,9 @@ fn compute_gradients<B: AutodiffBackend>(
     predicted_value: Tensor<B, 1>, target_value: Tensor<B, 1>
 ) -> (f32, f32, B::Gradients) {
     let difference = predicted_value - target_value.detach();
-    let policy_loss = -(target_policy.detach() * predicted_policy.log()).sum_dim(1).mean();
+    let policy_loss = -(target_policy.detach() * (predicted_policy + 1e-5).log()).sum_dim(1).mean();
     let value_loss = (difference.clone() * difference).mean();
+
     let loss = policy_loss.clone() + value_loss.clone() * VALUE_LOSS_WEIGHT;
 
     let policy_loss_val = policy_loss.into_scalar().to_f32();

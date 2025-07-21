@@ -9,7 +9,7 @@ pub const REPLAY_BUFFER_SIZE: usize = 100_000;
 pub const MIN_REPLAY_SIZE: usize = 20_000;
 pub const NUM_ITERATIONS: usize = 10_000;
 pub const NUM_EPISODES: usize = 100;
-pub const NUM_THREADS: usize = 6;
+pub const NUM_THREADS: usize = 8;
 
 pub const NUM_TRAIN_STEPS: usize = 40;
 pub const BATCH_SIZE: usize = 512;

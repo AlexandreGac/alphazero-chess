@@ -19,7 +19,7 @@ use tokio::sync::oneshot::channel;
 use crate::agent::AlphaZero;
 use crate::chess::{board_to_text, index_to_move, move_to_index, play_move, to_tensor, GameResult};
 use crate::parameters::{ACTION_SPACE, C_PUCT, DIRICHLET_ALPHA, DIRICHLET_EPSILON, NUM_SIMULATIONS, TEMPERATURE};
-use crate::training::{InferenceRequest, InferenceResult, PriorsCache};
+use crate::training::{InferenceRequest, InferenceResult, PriorsCache, CACHE_HITS, CACHE_MISSES};
 
 #[derive(Debug, Clone)]
 pub struct MCTree {
@@ -65,11 +65,13 @@ impl MCTree {
         let cache_reader = cache.read().await;
         let state_key = Fen::from_position(game, EnPassantMode::PseudoLegal);
         if let Some(entry) = cache_reader.get(&state_key) {
+            CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Self::new(*entry.policy, game, apply_noise)
         }
         else {
             drop(cache_reader);
 
+            CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (response_sender, response_receiver) = channel();
             sender.send(InferenceRequest {
                 state: game.clone(),
@@ -213,12 +215,14 @@ impl MCTree {
                 let cache_reader = cache.read().await;
                 let state_key = Fen::from_position(&leaf_state, EnPassantMode::PseudoLegal);
                 if let Some(entry) = cache_reader.get(&state_key) {
+                    CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.nodes.insert(max_index, Box::new(Self::new(*entry.policy, &leaf_state, false)));
                     entry.value
                 }
                 else {
                     drop(cache_reader);
 
+                    CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (response_sender, response_receiver) = channel();
                     sender.send(InferenceRequest {
                         state: leaf_state.clone(),

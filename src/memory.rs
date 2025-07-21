@@ -1,6 +1,5 @@
 use std::{collections::{HashMap, VecDeque}, fs::File, io::{BufReader, BufWriter}, path::Path};
 
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use rand::prelude::*;
 use ratatui::{layout::{Alignment, Constraint, Direction, Layout, Rect}, style::{Color, Modifier, Style}, widgets::{BarChart, Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap}, Frame};
 use serde::{Deserialize, Serialize};
@@ -104,7 +103,6 @@ impl ReplayBuffer {
     pub fn save(&self, path: &Path) {
         let file = File::create(path).expect("File creation error!");
         let writer = &mut BufWriter::new(file);
-        //let encoder = &mut GzEncoder::new(writer, Compression::fast());
         bincode::serde::encode_into_std_write(self, writer, bincode::config::standard()).expect("Encoding failed!");
     }
 
@@ -112,7 +110,6 @@ impl ReplayBuffer {
     pub fn load(path: &Path) -> Self {
         let file = File::open(path).expect("File does not exist!");
         let reader = &mut BufReader::new(file);
-        //let decoder = &mut GzDecoder::new(reader);
         let buffer = bincode::serde::decode_from_std_read(reader, bincode::config::standard())
             .expect("Decoding failed!");
 

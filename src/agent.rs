@@ -113,6 +113,7 @@ impl<B: Backend> AlphaZero<B> {
         // --- Shared Body ---
         let mut x = self.input_conv.forward(x);
         x = self.input_bn.forward(x);
+
         x = relu(x);
         for block in &self.res_blocks {
             x = block.forward(x);

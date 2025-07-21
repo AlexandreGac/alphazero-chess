@@ -72,7 +72,6 @@ dependencies = [
  "burn",
  "clap",
  "crossterm 0.29.0",
- "flate2",
  "itertools 0.14.0",
  "rand 0.8.5",
  "rand_distr 0.4.3",
