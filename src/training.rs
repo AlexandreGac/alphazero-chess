@@ -59,7 +59,7 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
         ReplayBuffer::new()
     };
 
-    let evaluator = load_model::<B>("artifacts/models_run_4/iteration_42_elo_135.mpk");
+    let evaluator = load_model::<B>("artifacts/evaluator/evaluator_elo_135.mpk");
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Value(1.0)))

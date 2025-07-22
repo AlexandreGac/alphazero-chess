@@ -32,5 +32,5 @@ pub const TEMPERATURE: f32 = 1.0;
 pub const C_PUCT: f32 = 3.0;
 
 pub const SKIP_VALIDATION: bool = true;
-pub const EVALUATION_GAMES: usize = 256;
+pub const EVALUATION_GAMES: usize = 1000;       //256
 pub const WIN_RATE_THRESHOLD: f32 = 0.55;
