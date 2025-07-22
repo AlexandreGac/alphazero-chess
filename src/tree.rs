@@ -65,11 +65,9 @@ impl MCTree {
     pub async fn async_init(sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>, game: &Chess, apply_noise: bool) -> Self {
         let state_key = Fen::from_position(game, EnPassantMode::PseudoLegal);
         if let Some(entry) = cache.get(&state_key).await {
-            CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Self::new(*entry.policy, game, apply_noise)
         }
         else {
-            CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let (response_sender, response_receiver) = channel();
             sender.send(InferenceRequest {
                 state: game.clone(),

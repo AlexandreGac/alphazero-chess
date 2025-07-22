@@ -59,7 +59,7 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
         ReplayBuffer::new()
     };
 
-    //let evaluator = load_model::<B>("artifacts/evaluator/evaluator_elo_716.mpk");
+    let evaluator = load_model::<B>("artifacts/models_run_4/iteration_42_elo_135.mpk");
     let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
     let mut optimizer = AdamWConfig::new()
         .with_grad_clipping(Some(GradientClippingConfig::Value(1.0)))
@@ -70,6 +70,9 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
     
     for iteration in 0..NUM_ITERATIONS {
         logger.log(MetricUpdate::IterationStart { iteration });
+
+        CACHE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
+        CACHE_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
 
         let start = Instant::now();
         let mut new_unique_states = 0;
@@ -109,9 +112,6 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
         } else {
             0.0
         };
-
-        CACHE_HITS.store(0, std::sync::atomic::Ordering::Relaxed);
-        CACHE_MISSES.store(0, std::sync::atomic::Ordering::Relaxed);
 
         logger.log(MetricUpdate::GeneralLog(format!(
             "Cache hit rate: {:.2}% ({} hits / {} total)",
@@ -233,8 +233,8 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
 
             let start = Instant::now();
             let players = vec![
-                //Player::BaseModel(evaluator.valid()),
-                Player::MiniMax(3),
+                Player::BaseModel(evaluator.valid()),
+                //Player::MiniMax(3),
                 Player::BaseModel(model.valid())
             ];
             let model_index = players.len() - 1;
