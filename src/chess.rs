@@ -1,4 +1,4 @@
-use std::{fmt::Write, str::FromStr};
+use std::{collections::HashMap, fmt::Write, str::FromStr};
 
 use burn::prelude::*;
 use rand::prelude::*;
@@ -6,8 +6,25 @@ use ratatui::{style::Style, text::{Line, Span, Text}};
 use shakmaty::{uci::UciMove, CastlingSide, Chess, Color, File, Move, Piece, Position, Rank, Role, Square};
 
 
-const NUM_HALFMOVES: u32 = 100;
-const NUM_FULLMOVES: u32 = 100;
+pub const NUM_HALFMOVES: u32 = 100;
+pub const NUM_FULLMOVES: u32 = 200;
+pub const REPETITIONS: usize = 3;
+
+#[derive(Debug, Clone)]
+pub struct GameState {
+    pub position: Chess,
+    pub pos_count: HashMap<Chess, usize>
+}
+
+impl GameState {
+    pub fn new() -> Self {
+        let position = Chess::new();
+        let mut pos_count = HashMap::new();
+        pos_count.insert(position.clone(), 1);
+
+        Self { position, pos_count }
+    }
+}
 
 pub enum GameResult {
     Ongoing,
@@ -16,7 +33,8 @@ pub enum GameResult {
     BlackWins
 }
 
-pub fn play_move(game: &mut Chess, action: Move) -> Result<GameResult, &'static str> {
+pub fn play_move(state: &mut GameState, action: Move) -> Result<GameResult, &'static str> {
+    let GameState { position: game, pos_count } = state;
     if !game.is_legal(action) {
         Err("Illegal move")
     }
@@ -31,7 +49,10 @@ pub fn play_move(game: &mut Chess, action: Move) -> Result<GameResult, &'static 
             })
         }
         else {
-            if game.halfmoves() < NUM_HALFMOVES && game.fullmoves().get() < NUM_FULLMOVES {
+            let count = pos_count.entry(game.clone()).or_insert(0);
+            *count += 1;
+
+            if *count < REPETITIONS && game.halfmoves() < NUM_HALFMOVES && game.fullmoves().get() < NUM_FULLMOVES {
                 Ok(GameResult::Ongoing)
             }
             else {
@@ -50,7 +71,7 @@ pub fn play_move(game: &mut Chess, action: Move) -> Result<GameResult, &'static 
 ///   - This single set of planes handles moves for Queens, Rooks, Bishops,
 ///     Kings (dist 1), and Pawns (including promotions to Queen).
 pub fn move_to_index(m: &Move, turn: Color) -> usize {
-    let from_square = m.from().expect("The move as no starting square!");
+    let from_square = m.from().expect("The move has no starting square!");
     let dest_square = m.to();
 
     let file = from_square.file().to_usize();

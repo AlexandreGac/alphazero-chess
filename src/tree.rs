@@ -13,12 +13,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 use shakmaty::fen::Fen;
-use shakmaty::{Chess, EnPassantMode, Position};
+use shakmaty::{EnPassantMode, Position};
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot::channel;
 
 use crate::agent::AlphaZero;
-use crate::chess::{board_to_text, index_to_move, move_to_index, play_move, to_tensor, GameResult};
+use crate::chess::{board_to_text, index_to_move, move_to_index, play_move, to_tensor, GameResult, GameState};
 use crate::parameters::{ACTION_SPACE, C_PUCT, DIRICHLET_ALPHA, DIRICHLET_EPSILON, NUM_SIMULATIONS, TEMPERATURE};
 use crate::training::{CacheEntry, InferenceRequest, InferenceResult, CACHE_HITS, CACHE_MISSES};
 
@@ -26,7 +26,7 @@ use crate::training::{CacheEntry, InferenceRequest, InferenceResult, CACHE_HITS,
 pub struct MCTree {
     pub nodes: HashMap<usize, Box<MCTree>>,
     pub moves: Vec<usize>,
-    pub state: Chess,
+    pub state: GameState,
 
     pub policy: Box<[f32; ACTION_SPACE]>,
     pub visits: Box<[f32; ACTION_SPACE]>,
@@ -34,7 +34,8 @@ pub struct MCTree {
 }
 
 impl MCTree {
-    pub fn init<B: Backend>(model: &AlphaZero<B>, game: Chess, apply_noise: bool) -> Self {
+    pub fn init<B: Backend>(model: &AlphaZero<B>, state: GameState, apply_noise: bool) -> Self {
+        let GameState { position: game, .. } = &state;
         let legal_moves = game.legal_moves()
             .iter()
             .map(|m| move_to_index(m, game.turn()))
@@ -54,7 +55,7 @@ impl MCTree {
         Self {
             nodes: HashMap::new(),
             moves: legal_moves,
-            state: game,
+            state,
 
             policy: Box::new(policy),
             visits: Box::new([0.0; ACTION_SPACE]),
@@ -62,10 +63,11 @@ impl MCTree {
         }
     }
 
-    pub async fn async_init(sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>, game: &Chess, apply_noise: bool) -> Self {
+    pub async fn async_init(sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>, state: GameState, apply_noise: bool) -> Self {
+        let GameState { position: game, .. } = &state;
         let state_key = Fen::from_position(game, EnPassantMode::PseudoLegal);
         if let Some(entry) = cache.get(&state_key).await {
-            Self::new(*entry.policy, game, apply_noise)
+            Self::new(*entry.policy, state, apply_noise)
         }
         else {
             let (response_sender, response_receiver) = channel();
@@ -75,14 +77,15 @@ impl MCTree {
             }).expect("Failed to send request!");
 
             let InferenceResult { policy, .. } = response_receiver.await.expect("No result provided!");
-            Self::new(*policy, game, apply_noise)
+            Self::new(*policy, state, apply_noise)
         }
     }
 
-    pub fn new(mut policy: [f32; ACTION_SPACE], state: &Chess, apply_noise: bool) -> Self {
-        let legal_moves = state.legal_moves()
+    pub fn new(mut policy: [f32; ACTION_SPACE], state: GameState, apply_noise: bool) -> Self {
+        let GameState { position: game, .. } = &state;
+        let legal_moves = game.legal_moves()
             .iter()
-            .map(|m| move_to_index(m, state.turn()))
+            .map(|m| move_to_index(m, game.turn()))
             .collect::<Vec<_>>();
 
         if apply_noise {
@@ -92,7 +95,7 @@ impl MCTree {
         Self {
             nodes: HashMap::new(),
             moves: legal_moves,
-            state: state.clone(),
+            state,
 
             policy: Box::new(policy),
             visits: Box::new([0.0; ACTION_SPACE]),
@@ -142,10 +145,10 @@ impl MCTree {
 
     fn expand<B: Backend>(&mut self, model: &AlphaZero<B>, max_index: usize) -> f32 {
         let mut leaf_state = self.state.clone();
-        let action = index_to_move(max_index, &leaf_state).expect("Illegal move!");
+        let action = index_to_move(max_index, &leaf_state.position).expect("Illegal move!");
         match play_move(&mut leaf_state, action) {
             Ok(GameResult::Ongoing) => {
-                let (policy_tensor, value_tensor) = model.forward(to_tensor(&leaf_state));
+                let (policy_tensor, value_tensor) = model.forward(to_tensor(&leaf_state.position));
                 let policy = policy_tensor.into_data()
                     .into_vec()
                     .unwrap()
@@ -153,7 +156,7 @@ impl MCTree {
                     .unwrap();
 
                 let value = value_tensor.into_scalar().to_f32();
-                self.nodes.insert(max_index, Box::new(Self::new(policy, &leaf_state, false)));
+                self.nodes.insert(max_index, Box::new(Self::new(policy, leaf_state, false)));
 
                 value
             }
@@ -205,25 +208,25 @@ impl MCTree {
 
     async fn async_expand(&mut self, sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>, max_index: usize) -> f32 {
         let mut leaf_state = self.state.clone();
-        let action = index_to_move(max_index, &leaf_state).expect("Illegal move!");
+        let action = index_to_move(max_index, &leaf_state.position).expect("Illegal move!");
         match play_move(&mut leaf_state, action) {
             Ok(GameResult::Ongoing) => {
-                let state_key = Fen::from_position(&leaf_state, EnPassantMode::PseudoLegal);
+                let state_key = Fen::from_position(&leaf_state.position, EnPassantMode::PseudoLegal);
                 if let Some(entry) = cache.get(&state_key).await {
                     CACHE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    self.nodes.insert(max_index, Box::new(Self::new(*entry.policy, &leaf_state, false)));
+                    self.nodes.insert(max_index, Box::new(Self::new(*entry.policy, leaf_state, false)));
                     entry.value
                 }
                 else {
                     CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let (response_sender, response_receiver) = channel();
                     sender.send(InferenceRequest {
-                        state: leaf_state.clone(),
+                        state: leaf_state.position.clone(),
                         response_sender: response_sender,
                     }).expect("Failed to send request!");
 
                     let InferenceResult { policy, value } = response_receiver.await.expect("No result provided!");
-                    self.nodes.insert(max_index, Box::new(Self::new(*policy, &leaf_state, false)));
+                    self.nodes.insert(max_index, Box::new(Self::new(*policy, leaf_state, false)));
                     value
                 }
             }
@@ -341,7 +344,7 @@ impl TreeViewerState {
             .expect("Invalid list index");
 
         if current_node.nodes.get(&action_index).is_some() {
-            let move_str = index_to_move(action_index, &current_node.state)
+            let move_str = index_to_move(action_index, &current_node.state.position)
                 .map(|m| format!("{m}"))
                 .unwrap_or(format!("IM{action_index}"));
             self.path_indices.push((select_index, move_str, action_index));
@@ -382,7 +385,7 @@ pub fn draw_board_view(frame: &mut Frame, area: Rect, state: &TreeViewerState) {
 
     let bold_style = Style::default().bold();
 
-    let board_text = board_to_text(&node.state);
+    let board_text = board_to_text(&node.state.position);
     let board_height = board_text.height() as u16;
 
     let stats_height = 1u16;
@@ -469,7 +472,7 @@ pub fn draw_stats_table(frame: &mut Frame, area: Rect, state: &mut TreeViewerSta
 
             let selection_value = if is_legal { q_value + u_value } else { f32::NEG_INFINITY };
             let move_marker = if !is_legal { "x" } else if node.nodes.get(&i).is_some() { "*" } else { " " };
-            let move_str = index_to_move(i, &node.state)
+            let move_str = index_to_move(i, &node.state.position)
                     .map(|m| format!("{m}"))
                     .unwrap_or(format!("IM{i}"));
 

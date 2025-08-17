@@ -8,7 +8,7 @@ pub fn play_against_model<B: Backend>(model_path: &String) {
     println!("==== Game starts ====");
     let human_player = Player::Human;
 
-    let human_start = true;
+    let human_start = false;
     let result = if human_start {
         play_one_game(&human_player, &opponent, TEMPERATURE_ANNEALING)
     } else {

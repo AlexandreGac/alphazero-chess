@@ -1,4 +1,4 @@
-use std::{path::Path, sync::{atomic::AtomicUsize}, thread, time::{self, Instant}, vec};
+use std::{path::Path, sync::atomic::AtomicUsize, thread, time::{self, Instant}, vec};
 
 use burn::{grad_clipping::GradientClippingConfig, module::{AutodiffModule, Module}, optim::{AdamWConfig, GradientsParams, Optimizer}, prelude::Backend, record::{FullPrecisionSettings, NamedMpkFileRecorder}, tensor::{backend::AutodiffBackend, cast::ToElement, Tensor}};
 use moka::future::Cache;
@@ -7,7 +7,7 @@ use rand::distributions::weighted::WeightedIndex;
 use shakmaty::{fen::Fen, Chess, Color, EnPassantMode, Position};
 use tokio::{runtime, sync::{mpsc::{self, UnboundedSender}, oneshot::Sender}, task::JoinSet};
 
-use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
+use crate::{agent::AlphaZero, chess::{index_to_move, play_move, to_tensor, GameResult, GameState, NUM_FULLMOVES}, load_model, logger::{MetricUpdate, TuiLogger}, memory::{ReplayBuffer, ReplaySampleWithPrediction}, parameters::{ACTION_SPACE, BASE_LEARNING_RATE, BATCH_SIZE, CACHE_CAPACITY, DECAY_INTERVAL, FULL_CYCLE, HALF_CYCLE, MAX_LEARNING_RATE, MIN_REPLAY_SIZE, NUM_EPISODES, NUM_ITERATIONS, NUM_THREADS, NUM_TRAIN_STEPS, SEED, SKIP_VALIDATION, TEMPERATURE_ANNEALING, VALUE_LOSS_WEIGHT, WEIGHT_DECAY, WIN_RATE_THRESHOLD}, ratings::compute_elo_rankings, tree::MCTree, validation::{evaluate, sample_search_tree, Player}};
 
 pub static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 pub static CACHE_MISSES: AtomicUsize = AtomicUsize::new(0);
@@ -239,7 +239,7 @@ pub fn train<B: AutodiffBackend>(model_path: &Option<String>) {
             ];
             let model_index = players.len() - 1;
             let (avg_batch_size, elo_ranks, winrate_matrix) = compute_elo_rankings(
-                players, 700.0, &runtime, false
+                players, 150.0, &runtime, false
             );
             
             let new_elo = elo_ranks[model_index];
@@ -292,22 +292,22 @@ fn compute_gradients<B: AutodiffBackend>(
 }
 
 async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<InferenceRequest>, cache: &Cache<Fen, CacheEntry>) -> Vec<EpisodeStep> {
-    let mut game = Chess::new();
+    let mut state = GameState::new();
     let mut history = vec![];
 
     let result = loop {
         let improved_policy = search_tree.async_monte_carlo_tree_search(sender, cache).await;
         let search_depth = search_tree.max_subtree_depth();
-        let turn = if game.turn() == Color::White { 1.0 } else { -1.0 };
+        let turn = if state.position.turn() == Color::White { 1.0 } else { -1.0 };
 
         history.push(EpisodeStep {
-            state: game.clone(),
+            state: state.position.clone(),
             improved_policy: improved_policy.clone(),
             final_value: turn,
             search_depth
         });
 
-        let action_index = if game.fullmoves().get() >= TEMPERATURE_ANNEALING {
+        let action_index = if state.position.fullmoves().get() >= TEMPERATURE_ANNEALING {
             improved_policy
                 .iter()
                 .enumerate()
@@ -320,8 +320,8 @@ async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<Inference
             distribution.sample(&mut thread_rng())
         };
 
-        let action = index_to_move(action_index, &game).expect("The model played an illegal move!");
-        match play_move(&mut game, action) {
+        let action = index_to_move(action_index, &state.position).expect("The model played an illegal move!");
+        match play_move(&mut state, action) {
             Ok(GameResult::Ongoing) => search_tree = search_tree.traverse_new(action_index, true),
             Ok(GameResult::Draw) => break 0.0,
             Ok(_) => break turn,
@@ -329,8 +329,9 @@ async fn run_episode(mut search_tree: MCTree, sender: &UnboundedSender<Inference
         }
     };
 
+    let decay_factor = 1.0 - (state.position.fullmoves().get() as f32 / (2.0 * NUM_FULLMOVES as f32));
     for episode_step in &mut history {
-        episode_step.final_value *= result;
+        episode_step.final_value *= result * decay_factor;
     }
 
     history
@@ -340,8 +341,8 @@ async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<Episode
     let (sender, mut receiver) = mpsc::unbounded_channel::<InferenceRequest>();
     let cache = Cache::new(CACHE_CAPACITY);
 
-    let game = Chess::new();
-    let (policy_tensor, _value_tensor) = model.forward(to_tensor(&game));
+    let state = GameState::new();
+    let (policy_tensor, _value_tensor) = model.forward(to_tensor(&state.position));
     let policy = policy_tensor.into_data()
         .into_vec()
         .unwrap()
@@ -350,11 +351,11 @@ async fn run_all_episodes<B: Backend>(model: &AlphaZero<B>) -> (f32, Vec<Episode
 
     let mut tasks = JoinSet::new();
     for _episode in 0..NUM_EPISODES {
-        let game = game.clone();
+        let state = state.clone();
         let sender = sender.clone();
         let cache = cache.clone();
         tasks.spawn(async move {
-            let search_tree = MCTree::new(policy, &game, true);
+            let search_tree = MCTree::new(policy, state, true);
             run_episode(search_tree, &sender, &cache).await
         });
     }

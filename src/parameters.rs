@@ -1,3 +1,5 @@
+// Since models_run_20, threefold repetition rule is enforced + win reward decreases with time + 200 fullmoves time limit
+
 pub const ACTION_SPACE: usize = 64 * 8 * 8;
 pub const CACHE_CAPACITY: u64 = 500_000;
 
@@ -26,11 +28,11 @@ pub const WEIGHT_DECAY: f32 = 1e-4;
 pub const DIRICHLET_ALPHA: f32 = 0.3;
 pub const DIRICHLET_EPSILON: f32 = 0.25;
 
-pub const TEMPERATURE_ANNEALING: u32 = 15;    // 15 moves each
+pub const TEMPERATURE_ANNEALING: u32 = 15;
 pub const NUM_SIMULATIONS: usize = 256;
 pub const TEMPERATURE: f32 = 1.0;
 pub const C_PUCT: f32 = 3.0;
 
 pub const SKIP_VALIDATION: bool = true;
-pub const EVALUATION_GAMES: usize = 1000;       //256
+pub const EVALUATION_GAMES: usize = 256;       //256
 pub const WIN_RATE_THRESHOLD: f32 = 0.55;
